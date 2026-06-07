@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.8](https://github.com/stoatchat/stoatchat/compare/v0.13.7...v0.13.8) (2026-06-07)
+
+
+### Bug Fixes
+
+* openapi using old naming ([#777](https://github.com/stoatchat/stoatchat/issues/777)) ([c70459b](https://github.com/stoatchat/stoatchat/commit/c70459b10ce107611b9d478add26db372361baf2))
+* point docs favicon to correct location ([#789](https://github.com/stoatchat/stoatchat/issues/789)) ([bebfe34](https://github.com/stoatchat/stoatchat/commit/bebfe349227d8cc555e1b488eb343f2c28b28b88))
+
 ## [0.13.7](https://github.com/stoatchat/stoatchat/compare/v0.13.6...v0.13.7) (2026-05-21)
 
 
