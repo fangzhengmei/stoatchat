@@ -540,6 +540,233 @@ file.used_for.is_none() && !file.deleted.is_some_and(|v| v)
 
 ---
 
+### 4.9 成员分块迭代器：offset 边界写反导致首次迭代即返回 None
+
+**Bug 概述**：`ChunkedServerMembersGenerator::Reference` 分支的 `next()` 方法将终止条件 `offset >= data.len()` 错写为 `data.len() >= offset`，导致 offset 从 0 起步时首次调用就返回 `None`，迭代器永远无法产出任何成员。
+
+---
+
+#### 4.9.1 代码证据
+
+[ops.rs#L55-L63](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/server_members/ops.rs#L55-L63)：
+
+```rust
+ChunkedServerMembersGenerator::Reference { offset, data } => {
+    if let Some(data) = data {
+        if data.len() as i32 >= *offset {   // ← Bug：应为 *offset >= data.len() as i32
+            None
+        } else {
+            let resp = &data[*offset as usize];
+            *offset += 1;
+            Some(resp.clone())
+        }
+    } else {
+        warn!("...");
+        None
+    }
+}
+```
+
+初始状态由 `new_reference` 设置（[ops.rs#L36-L41](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/server_members/ops.rs#L36-L41)）：
+
+```rust
+pub fn new_reference(data: Vec<Member>) -> Self {
+    ChunkedServerMembersGenerator::Reference {
+        offset: 0,
+        data: Some(data),
+    }
+}
+```
+
+**逻辑推演**：offset=0, data.len()=N (N≥0)
+
+| 条件 | 当前代码 | 正确逻辑 |
+|------|---------|---------|
+| 终止判断 | `N >= 0` → 恒为 true → 返回 None | `0 >= N` → 当 N>0 时为 false → 返回 data[0] |
+| 首次迭代 | **永远返回 None** | 返回第一个元素 |
+
+正确写法应为：
+
+```rust
+if *offset >= data.len() as i32 {
+    None
+} else { ... }
+```
+
+---
+
+#### 4.9.2 下游影响链：pushd 全员@和角色@静默失败
+
+迭代器由 pushd 守护进程的 `mass_mention` 消费者使用（[mass_mention.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs)）：
+
+**路径一：@everyone / @here 触发**（[mass_mention.rs#L135-L188](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L135-L188)）
+
+```rust
+let mut db_query = self.db.fetch_all_members_chunked(&payload.server_id).await?;
+loop {
+    let mut chunk: Vec<Member> = vec![];
+    for _ in 0..config.pushd.mass_mention_chunk_size {
+        if let Some(member) = db_query.next().await {
+            chunk.push(member);
+        } else {
+            exhausted = true;
+            break;
+        }
+    }
+    // ... 为 chunk 中的用户发送推送通知 ...
+    if exhausted { break; }
+}
+```
+
+**路径二：角色@触发**（[mass_mention.rs#L189-L209](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L189-L209)）
+
+```rust
+let mut role_members = self.db.fetch_all_members_with_roles_chunked(&payload.server_id, roles).await?;
+while !exhausted {
+    chunk.clear();
+    for _ in 0..config.pushd.mass_mention_chunk_size {
+        if let Some(member) = role_members.next().await {
+            chunk.push(member);
+        } else {
+            exhausted = true;
+            break;
+        }
+    }
+    // ... 为 chunk 中的用户发送推送通知 ...
+}
+```
+
+**影响链路**：
+
+1. 用户在服务器中发送 `@everyone` 或 `@role` 消息
+2. pushd 收到消息事件，调用 `fetch_all_members_chunked` 或 `fetch_all_members_with_roles_chunked`
+3. 首次 `next()` 返回 None → chunk 为空 → `exhausted = true`
+4. 循环立即退出，不进入推送逻辑
+5. **结果**：所有服务器成员收不到 @everyone 通知；角色成员收不到 @role 通知——静默失败，无报错
+
+MongoDB 后端使用 `SessionCursor` 驱动迭代，不受此 Bug 影响。只有 Reference 后端使用 `offset + Vec` 模拟，命中此 Bug。
+
+---
+
+### 4.10 图片 hash animated 字段：两套后端触发条件完全相反
+
+**Bug 概述**：`set_attachment_hash_animated` 在 MongoDB 中只对 `animated` 字段尚未设置（`$exists: false`）的图片写入，而 Reference 中只对 `animated` 字段**已经设置**（`Some`）的图片覆盖——两者触发条件完全相反，导致同一调用在两套后端上行为互斥。
+
+---
+
+#### 4.10.1 代码证据
+
+**MongoDB 实现**（[mongodb.rs#L55-L71](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/file_hashes/ops/mongodb.rs#L55-L71)）：
+
+```rust
+async fn set_attachment_hash_animated(&self, hash: &str, animated: bool) -> Result<()> {
+    self.col::<FileHash>(COL)
+        .update_one(
+            doc! {
+                "_id": hash,
+                "metadata.type": "Image",
+                "metadata.animated": { "$exists": false },   // ← 只匹配 animated 不存在的记录
+            },
+            doc! {
+                "$set": {
+                    "metadata.animated": animated
+                }
+            },
+        )
+        .await
+}
+```
+
+条件：`_id 匹配 AND 类型为 Image AND animated 字段不存在` → **只写未设 animated 的图片**
+
+**Reference 实现**（[reference.rs#L45-L61](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/file_hashes/ops/reference.rs#L45-L61)）：
+
+```rust
+async fn set_attachment_hash_animated(&self, hash: &str, animated: bool) -> Result<()> {
+    let mut hashes = self.file_hashes.lock().await;
+    if let Some(FileHash {
+        metadata:
+            Metadata::Image {
+                animated: Some(animated_metadata),   // ← 只匹配 animated 已是 Some 的记录
+                ..
+            },
+        ..
+    }) = hashes.get_mut(hash)
+    {
+        *animated_metadata = animated;
+        Ok(())
+    } else {
+        Err(create_error!(NotFound))
+    }
+}
+```
+
+条件：`hash 匹配 AND 类型为 Image AND animated 是 Some` → **只写已有 animated 的图片**
+
+**对比**：
+
+| 维度 | MongoDB | Reference |
+|------|---------|-----------|
+| 触发条件 | `animated` **不存在**（None） | `animated` **已存在**（Some） |
+| 首次写入（animated=None） | ✅ 匹配 `$exists: false`，成功写入 | ❌ 不匹配 `Some`，返回 NotFound |
+| 重复写入（animated=Some） | ❌ 不匹配 `$exists: false`，静默跳过 | ✅ 匹配 `Some`，覆盖写入 |
+| 语义 | "只在未设时写一次" | "只在已设时覆盖" |
+
+---
+
+#### 4.10.2 调用上下文与实际影响
+
+唯一调用方是 Autumn 文件服务（[api.rs#L389-L408](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/services/autumn/src/api.rs#L389-L408)）：
+
+```rust
+let is_animated = match &hash.metadata {
+    Metadata::Image { animated: Some(value), .. } => *value,
+    Metadata::Image { animated: None, .. } => {
+        // ... 下载文件，检测是否动态图 ...
+        let animated = is_animated(&named_file, &hash.content_type).unwrap_or(false);
+        db.set_attachment_hash_animated(&hash.id, animated).await?;
+        animated
+    }
+    _ => false,
+};
+```
+
+**逻辑**：当 `animated` 为 `None` 时，才调用 `set_attachment_hash_animated` 做首次检测写入。
+
+**MongoDB 行为**：`animated` 为 None → `$exists: false` 匹配 → 成功写入 → ✅ 符合预期
+
+**Reference 行为**：`animated` 为 None → 不匹配 `Some(animated_metadata)` → 返回 `NotFound` 错误 → ❌ 与预期相反
+
+**后果链**：
+
+1. 用户上传图片，`FileHash` 初始创建时 `animated: None`
+2. 首次访问图片时，Autumn 检测到 `animated: None`，调用 `set_attachment_hash_animated`
+3. Reference 后端返回 `NotFound`，向上传播为 404 错误
+4. **首次图片访问失败**，animated 元数据永远无法被写入
+5. 后续每次访问都会重新触发检测（因为 `animated` 始终为 None），每次都会失败
+6. 最终结果：Reference 后端下图片的 animated 标记永远为 None，动态图/静态图的区分完全失效
+
+Reference 实现的正确写法应为：
+
+```rust
+if let Some(FileHash {
+    metadata:
+        Metadata::Image {
+            animated: animated_metadata @ None,  // 匹配 None，而非 Some
+            ..
+        },
+    ..
+}) = hashes.get_mut(hash)
+{
+    *animated_metadata = Some(animated);
+    Ok(())
+} else {
+    Err(create_error!(NotFound))
+}
+```
+
+---
+
 ## 5. 架构模式总结
 
 ### 5.1 职责分界三棱图
@@ -590,6 +817,8 @@ Reference 后端的核心定位是**测试替身**，而非生产替代品。证
 |----------|------|------|
 | 🔴 高 | `delete_messages` retain 条件误用 AND 替代 OR，导致目标频道消息全删、其他频道命中列表的消息被误删 | [reference.rs#L282-L289](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L282-L289) |
 | 🔴 高 | `mark_attachments_as_deleted` 批量版本误用 `reported` 字段替代 `deleted`，导致附件双重击穿、永久卡在生命周期夹缝 | [reference.rs#L117-L133](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/files/ops/reference.rs#L117-L133) |
+| 🔴 高 | `ChunkedServerMembersGenerator::Reference` 的 `next()` 边界条件写反，首次迭代即返回 None，pushd @everyone/@role 推送静默失败 | [ops.rs#L55-L63](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/server_members/ops.rs#L55-L63) |
+| 🔴 高 | `set_attachment_hash_animated` 触发条件相反：MongoDB 只写未设的，Reference 只写已设的，导致图片 animated 标记永远无法首次写入 | [reference.rs#L45-L61](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/file_hashes/ops/reference.rs#L45-L61) vs [mongodb.rs#L55-L71](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/file_hashes/ops/mongodb.rs#L55-L71) |
 | 🔴 高 | `fetch_messages` pinned 过滤逻辑完全反转，`pinned=true` 返回非置顶消息 | [reference.rs#L61-L65](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L61-L65) |
 | 🔴 高 | `delete_channel`/`delete_server` 级联删除差异导致 Reference 残留幽灵数据 | channels/ops/reference.rs、servers/ops/reference.rs |
 | 🔴 高 | `find_saved_messages_channel` 在 Reference 中用 user_id 做 HashMap key，与 MongoDB 语义不符 | channels/ops/reference.rs#L55-L61 |
