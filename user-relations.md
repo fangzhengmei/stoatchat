@@ -1211,3 +1211,360 @@ have_mutual_connection() → 查询共同服务器/群组
 **对比真正的"自己看自己"**：当 perspective.id == other_user.id 时，② 号检查会直接返回 `u64::MAX`。而机器人所有者虽然被赋予 `User` 关系状态，却享受不到同等待遇。
 
 这可能是代码中的一个**逻辑缺陷**或**待完善的设计**：要么应该在 `calculate_user_permissions` 中给 `User` 分支加上 `return u64::MAX.into()`，要么应该让 `are_the_users_same()` 也检查机器人所有者关系。当前的行为意味着机器人所有者对机器人的权限取决于是否有共同连接，而不是像代码注释所说的"assume owner is the same as bot"。
+
+---
+
+## 13. 关系字段进入客户端的完整序列化链路
+
+关系状态不是直接从数据库原样输出给客户端的，而是经过了**四条不同的序列化路径**。每条路径在不同的业务场景下使用，对关系字段的处理方式也各不相同。
+
+### 13.1 四条序列化路径总览
+
+所有路径都在 [bridge/v0.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/bridge/v0.rs#L994-L1197) 中，是 `crate::User` 的方法，返回 `v0::User`（API 层模型）。
+
+| 方法 | 签名 | 关系处理方式 | 典型使用场景 |
+|------|------|-------------|-------------|
+| `into_self()` | `self, force_online` | 强制 `relationship=User`，携带全部 relations 列表 | 查看自己的资料 |
+| `into()` | `self, db, perspective` | 完整权限引擎 + 关系数组读取 | 查看单个陌生人/好友资料 |
+| `into_known()` | `self, perspective, is_online` | 直接读关系数组 + 仅判断是否被拉黑 | 批量获取用户（群成员列表） |
+| `into_known_static()` | `self, is_online` | 强制 `relationship=None`，不带 relations | 消息作者等无视角场景 |
+
+### 13.2 路径一：into_self（自己看自己）
+
+位置：[bridge/v0.rs#L1164-L1197](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/bridge/v0.rs#L1164-L1197)
+
+```rust
+pub async fn into_self(self, force_online: bool) -> User {
+    User {
+        relations: self.relations.unwrap_or_default()  // ① 完整返回所有关系列表
+            .into_iter()
+            .map(|relation| relation.into())
+            .collect(),
+        ...
+        relationship: RelationshipStatus::User,        // ② 强制 User 状态
+        ...
+    }
+}
+```
+
+**特点**：
+- 不接受 perspective 参数，天然就是"自己看自己"
+- `relationship` 硬编码为 `User`，不需要任何计算
+- `relations` 完整返回，客户端可以看到自己对所有人的关系状态
+- 在线状态也完全公开（除非设为隐身）
+
+**调用场景**：
+- `GET /users/@me` —— [fetch_self.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/delta/src/routes/users/fetch_self.rs)
+- `GET /users/<target>` 且 target 是自己 —— [fetch_user.rs#L17-L18](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/delta/src/routes/users/fetch_user.rs#L17-L18)
+- 机器人管理 API（创建/编辑机器人，查看自己的机器人列表）
+
+### 13.3 路径二：into（常规权限路径）
+
+位置：[bridge/v0.rs#L994-L1070](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/bridge/v0.rs#L994-L1070)
+
+这是最完整、计算量最大的一条路径。关系和可见性是**分开计算**的：
+
+```rust
+pub async fn into<'a, P>(self, db: &Database, perspective: P) -> User
+where P: Into<Option<&'a crate::User>>
+{
+    let perspective = perspective.into();
+    let (relationship, can_see_profile) = if self.bot.is_some() {
+        // ① 机器人短路：直接返回 None + true
+        (RelationshipStatus::None, true)
+    } else if let Some(perspective) = perspective {
+        let mut query = DatabasePermissionQuery::new(db, perspective).user(&self);
+
+        if perspective.id == self.id {
+            // ② 字面自己看自己：直接返回 User + true
+            (RelationshipStatus::User, true)
+        } else {
+            (
+                // ③ 关系状态：直接从 perspective.relations 数组中查找
+                perspective.relations.as_ref().map(|relations| {
+                    relations.iter()
+                        .find(|r| r.id == self.id)
+                        .map(|r| r.status.clone().into())
+                        .unwrap_or_default()
+                }).unwrap_or_default(),
+                // ④ 资料可见性：调用完整权限引擎计算
+                calculate_user_permissions(&mut query)
+                    .await
+                    .has_user_permission(UserPermission::ViewProfile),
+            )
+        }
+    } else {
+        (RelationshipStatus::None, false)
+    };
+    // ... 组装 User 对象 ...
+}
+```
+
+**关键点**：
+- `relationship` 直接从 `perspective.relations` 数组读取，**不经过权限引擎**
+- `can_see_profile` 由 `calculate_user_permissions()` 完整计算，考虑好友、屏蔽、共同连接等所有因素
+- 机器人有最高优先级的短路：直接设为 `None` + `true`，跳过后续所有计算
+
+**调用场景**：
+- `GET /users/<target>` 且 target 不是自己 —— 单个用户详情查询
+
+### 13.4 路径三：into_known（已知用户路径）
+
+位置：[bridge/v0.rs#L1075-L1134](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/bridge/v0.rs#L1075-L1134)
+
+```rust
+pub async fn into_known<'a, P>(self, perspective: P, is_online: bool) -> User
+where P: Into<Option<&'a crate::User>>
+{
+    let (relationship, can_see_profile) = if self.bot.is_some() {
+        (RelationshipStatus::None, true)                // ① 同样的机器人短路
+    } else if let Some(perspective) = perspective {
+        if perspective.id == self.id {
+            (RelationshipStatus::User, true)             // ② 同样的自己短路
+        } else {
+            let relationship = perspective.relations     // ③ 同样的关系读取
+                .as_ref()
+                .map(...find...map...unwrap_or_default())
+                .unwrap_or_default();
+
+            let can_see_profile = relationship != RelationshipStatus::BlockedOther;
+                                                         // ④ 只判断是否被对方拉黑！
+            (relationship, can_see_profile)
+        }
+    } else {
+        (RelationshipStatus::None, false)
+    };
+    // ...
+    relations: vec![],                                    // ⑤ relations 永远是空数组
+    // ...
+}
+```
+
+**注释原文**：
+> Convert user object into user model assuming mutual connection
+> Relations will never be included, i.e. when we process ourselves
+
+"assuming mutual connection"——**假设已经有共同连接**（如在同一个服务器/频道里）。
+
+**与 into() 的核心区别**：
+- `can_see_profile` 的计算方式不同：`into()` 调用完整权限引擎，`into_known()` 只判断 `relationship != BlockedOther`
+- `relations` 字段：`into()` 只有自己看自己时才返回完整列表，`into_known()` 永远返回空数组
+
+**调用场景**：
+- 批量获取用户列表（群成员、服务器成员等）
+- `User::fetch_many_ids_as_mutuals()` —— [model.rs#L360-L374](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/models/users/model.rs#L360-L374)
+- bonfire 网关推送 Ready 事件时的用户列表 —— [bonfire/impl.rs#L278-L282](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/bonfire/src/events/impl.rs#L278-L282)
+
+### 13.5 路径四：into_known_static（静态无视角路径）
+
+位置：[bridge/v0.rs#L1137-L1162](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/bridge/v0.rs#L1137-L1162)
+
+```rust
+pub async fn into_known_static(self, is_online: bool) -> User {
+    User {
+        relations: vec![],                          // 空
+        ...
+        relationship: RelationshipStatus::None,     // 强制 None
+        ...
+    }
+}
+```
+
+注释说明：`events client will populate this from cache`——事件客户端会从缓存填充关系字段。
+
+**特点**：
+- 完全不接受 perspective 参数，没有任何视角概念
+- `relationship` 硬编码为 `None`
+- `relations` 是空数组
+- 在线状态作为参数传入（由调用方批量查询后传入）
+
+**调用场景**：
+- 消息作者（发送消息时序列化发送者）—— [message_send.rs#L166-L168](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/delta/src/routes/channels/message_send.rs#L166-L168)
+- 其他不需要视角、由客户端自行补充关系信息的场景
+
+---
+
+## 14. 机器人短路：所有者的内置 User 状态在序列化层被拍回 None
+
+### 14.1 代码中的"双重人格"
+
+机器人所有者关系状态在**两层**有不同的处理，且结果互相矛盾：
+
+**第一层：权限引擎层 —— 返回 User**
+
+位置：[permissions.rs#L56-L62](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/permissions.rs#L56-L62)
+
+```rust
+} else if let Some(bot) = &other_user.bot {
+    // For the purposes of permissions checks,
+    // assume owner is the same as bot
+    if self.perspective.id == bot.owner {
+        return RelationshipStatus::User;  // 权限计算时：所有者 = 用户自己
+    }
+}
+```
+
+**第二层：序列化层 —— 直接拍回 None**
+
+位置：[bridge/v0.rs#L1000-L1001](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/bridge/v0.rs#L1000-L1001) 和 [bridge/v0.rs#L1080-L1081](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/bridge/v0.rs#L1080-L1081)
+
+```rust
+// into() 和 into_known() 中完全相同的短路
+if self.bot.is_some() {
+    (RelationshipStatus::None, true)  // 序列化输出时：机器人 = 无关系 + 可见
+}
+```
+
+### 14.2 为什么会有这个分歧？
+
+这不是 bug，而是**两套独立逻辑服务于不同目的**：
+
+| 层面 | 返回值 | 目的 |
+|------|--------|------|
+| 权限引擎层 | `User` | 让所有者对自己的机器人拥有特殊权限（虽然实际上落入了 `_ => {}` 分支，见第 12 节） |
+| 序列化层 | `None` | 客户端 UI 显示需求——机器人不应该显示"好友"、"待接受"等关系状态 |
+
+机器人是一个特殊的实体：
+- **对普通用户**：机器人是一个"用户"，但不应该有好友、请求等关系概念
+- **对所有者**：机器人是自己的资产，但客户端界面上仍然显示为"无关系"，因为关系系统是为人与人设计的
+
+序列化层的短路优先级更高（它在 if 链的最前面），所以**客户端看到的机器人关系永远是 None**，不管权限引擎怎么想。
+
+### 14.3 两条路径的完整执行顺序对比
+
+**场景：机器人所有者查看自己的机器人**
+
+```
+into() 路径：
+  1. self.bot.is_some() → true
+     → 直接返回 (None, true)
+     → 权限引擎根本不会被调用！
+     → user_relationship() 中的 User 分支完全不会执行
+```
+
+```
+calculate_user_permissions() 单独调用时（如频道权限计算）：
+  1. are_we_privileged() → false
+  2. are_the_users_same() → false（owner_id ≠ bot_id）
+  3. user_relationship() → User（命中 bot.owner 分支）
+  4. match User → _ => {} → permissions = 0
+  5. have_mutual_connection() → ...
+```
+
+所以：**序列化时永远看不到 User 状态，只有在纯权限计算场景下才会返回 User，但 User 又被权限计算函数忽略了**。这就形成了一个"两层都有特殊处理，但两层都没真正生效"的奇特状态。
+
+### 14.4 为什么机器人短路在最前面？
+
+看代码结构：
+
+```rust
+if self.bot.is_some() {
+    (RelationshipStatus::None, true)       // ① 机器人短路（最优先）
+} else if let Some(perspective) = perspective {
+    if perspective.id == self.id {
+        (RelationshipStatus::User, true)   // ② 自己短路
+    } else {
+        ...                                 // ③ 常规计算
+    }
+} else {
+    (RelationshipStatus::None, false)      // ④ 无视角
+}
+```
+
+机器人短路在自己短路**之前**。这意味着即使机器人的 ID 和 perspective 的 ID 相同（理论上不可能，因为机器人是另一个账号），也会先命中机器人短路。
+
+但更实际的含义是：**机器人永远不会走"自己看自己"的分支**，哪怕某个 API 不小心把机器人自己传成了 perspective，也会被机器人短路拦截。这是一种防御性设计——机器人不应该有"自己看自己"的概念。
+
+---
+
+## 15. 两套"自己看自己"判定并存的真实行为
+
+### 15.1 两套判定分别在哪里
+
+代码中有**两处独立的**"自己看自己"判定，服务于不同的层次：
+
+**第一套：字面 ID 比对 —— 序列化层**
+
+位置：[bridge/v0.rs#L1005-L1006](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/bridge/v0.rs#L1005-L1006) 和 [bridge/v0.rs#L1083-L1084](file:///d:/fz/0601-1/solo-dogfeeding/code/85-frontend/crates/core/database/src/util/bridge/v0.rs#L1083-L1084)
+
+```rust
+if perspective.id == self.id {
+    (RelationshipStatus::User, true)
+}
+```
+
+直接比较两个用户 ID 字符串。
+
+**第二套：机器人所有者扩展 —— 权限查询层**
+
+位置：[permissions.rs#L56-L62](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/permissions.rs#L56-L62)
+
+```rust
+} else if let Some(bot) = &other_user.bot {
+    if self.perspective.id == bot.owner {
+        return RelationshipStatus::User;
+    }
+}
+```
+
+不仅比较 ID，还扩展了"如果 perspective 是对方机器人的所有者，也算自己"。
+
+### 15.2 两套判定的覆盖关系
+
+```
+                    ┌─────────────────────────────────┐
+                    │     序列化层：字面 ID 比对      │
+                    │  perspective.id == self.id     │
+                    └─────────────────────────────────┘
+                                    │
+                  命中 → (User, true) ← 直接返回，不调用权限引擎
+                                    │
+                              未命中 ↓
+                    ┌─────────────────────────────────┐
+                    │      权限查询层：bot.owner      │
+                    │  perspective.id == bot.owner   │
+                    └─────────────────────────────────┘
+                                    │
+                  命中 → 返回 User ← 但 calculate_user_permissions 中落入 _ => {}
+                                    │
+                              未命中 ↓
+                          继续常规关系匹配
+```
+
+**关键结论**：两套判定是**串行**的，不是并行的。序列化层的判定在前，如果命中直接返回，根本不会走到权限查询层。只有当序列化层判定不命中时，权限查询层的扩展判定才有可能生效——但它生效的结果又被 `calculate_user_permissions` 的 match 忽略了。
+
+### 15.3 各场景下的实际行为
+
+| 场景 | 序列化层判定 | 权限层判定 | 最终 relationship | 最终 can_see_profile |
+|------|-------------|-----------|-------------------|---------------------|
+| 真·自己看自己 | ✅ 命中 | ❌ 不会执行 | `User` | `true` |
+| 机器人所有者看机器人 | ❌ 不命中（但被机器人短路拦截） | ❌ 不会执行 | `None`（机器人短路） | `true`（机器人短路） |
+| 陌生人看陌生人 | ❌ 不命中 | ❌ 不命中 | 从 relations 读 | 权限引擎计算 |
+| 纯权限计算（无序列化） | —— | ✅ 命中 | `User`（仅内部返回） | 按 `_ => {}` 分支计算 |
+
+### 15.4 为什么需要两套？
+
+从设计意图推断：
+
+1. **序列化层的字面比对**是为了**性能和正确性**：自己看自己时不需要查权限引擎，直接返回 `User` + 完整可见性，又快又准。
+
+2. **权限层的机器人所有者扩展**是为了**语义一致性**：注释写着 "assume owner is the same as bot"，本意是让所有者对机器人拥有"对自己一样"的权限。
+
+但两套判定的**衔接出了问题**：
+- 序列化层不知道机器人所有者的概念，只看 ID
+- 权限层虽然知道机器人所有者，但它返回的 `User` 状态在 `calculate_user_permissions` 中没有对应的全开分支
+
+结果就是：**机器人所有者扩展只存在于 `user_relationship()` 的返回值里，上下都不接**——上面序列化层有机器人短路把它盖掉，下面权限计算函数有 `_ => {}` 把它吞掉。
+
+### 15.5 一个反直觉的推论
+
+因为机器人短路在序列化层的最前面，而机器人短路返回 `(None, true)`，所以：
+
+> **所有人看机器人，关系都是 None，资料都可见**
+
+包括：
+- 机器人所有者看自己的机器人 → None
+- 陌生人看机器人 → None
+- 机器人看自己（理论上不会发生）→ None
+
+这符合社交平台上机器人的设计：机器人是公开可见的服务实体，没有好友关系的概念。`user_relationship()` 中 `bot.owner` 返回 `User` 的分支，在序列化场景下永远不会暴露给客户端。
