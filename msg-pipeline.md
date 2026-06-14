@@ -1032,7 +1032,10 @@ for user in users {
 
 ### 10.3 ack worker 防抖合并批次
 
+> **更正说明**：本节中关于防抖窗口的描述之前有误。实际的防抖机制不是 500ms，而是由 5 秒静默 + 30 秒硬上限的双层控制决定。详见下方修正。
+
 **文件**: [ack.rs#L213-L310 (worker)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L213-L310)
+**文件**: [mod.rs#L34-L67 (DelayedTask)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/mod.rs#L34-L67)
 
 ack worker 的主循环是每秒一次的"扫描-处理-入队"三阶段：
 
@@ -1056,13 +1059,102 @@ ack worker 的主循环是每秒一次的"扫描-处理-入队"三阶段：
 1. **ProcessMessage 合并** — `existing.push(new_event)` 追加到同批次
 2. **AckMessage 合并** — `task.data.event = event` 直接覆盖（保留最新 ack）
 
-**`DelayedTask` 的延迟机制**：
+**`DelayedTask` 的双层时间窗口机制**：
 
-- 新任务首次入队：`DelayedTask::new(Task { event })` — 延迟 `TASK_DELAY_MS`（500ms）
-- 追加时：`task.delay()` — 重新计算延迟时间（再等 500ms）
-- 到期时：`task.should_run()` 返回 true，任务被提交
+**文件**: [mod.rs#L62-L66 (should_run)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/mod.rs#L62-L66)
 
-效果：同一频道在 500ms 内的多条消息会被合并到同一个 `ProcessMessage` 批次中，减少 MongoDB `$push` 和 AMQP 发布次数。
+```rust
+pub fn should_run(&self) -> bool {
+    self.run_now
+        || self.first_seen.elapsed().as_secs() > EXPIRE_CONSTANT  // 30s
+        || self.last_updated.elapsed().as_secs() > SAVE_CONSTANT  // 5s
+}
+```
+
+常量定义：
+- `SAVE_CONSTANT = 5` — 静默窗口：距离最后一次更新 ≥ 5 秒则提交（正常防抖）
+- `EXPIRE_CONSTANT = 30` — 硬上限：距离首次看到 ≥ 30 秒则强制提交（防止永远追加）
+- `run_now` — 立即执行标记（mass mention 用）
+
+```
+时间线示例：
+  0s: 消息 A 入队 → first_seen=0, last_updated=0
+  2s: 消息 B 追加 → last_updated=2
+  4s: 消息 C 追加 → last_updated=4
+  8s: 扫描 → last_updated.elapsed()=4 < 5, first_seen.elapsed()=8 < 30 → 不提交
+  9s: 消息 D 追加 → last_updated=9
+ 14s: 扫描 → last_updated.elapsed()=5 ≥ 5 → 提交
+```
+
+效果：同一频道在 **5 秒静默窗口** 内的多条消息会被合并到同一个 `ProcessMessage` 批次中，减少 MongoDB `$push` 和 AMQP 发布次数。极端活跃频道最多 **30 秒** 硬上限保证最终提交。
+
+---
+
+### 10.3.1 五 worker 共享队列的键分裂问题
+
+**文件**: [mod.rs#L8-L24 (start_workers)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/mod.rs#L8-L24)
+
+```rust
+const WORKER_COUNT: usize = 5;
+
+pub fn start_workers(db: Database, amqp: AMQP) {
+    // ...
+    for _ in 0..WORKER_COUNT {
+        task::spawn(ack::worker(db.clone(), amqp.clone()));
+        // ...
+    }
+}
+```
+
+启动 5 个 `ack::worker` 实例，但它们的结构是：
+
+```
+                  static Q: Lazy<Queue<Data>> (容量 10,000，所有 worker 共享)
+                    │   try_pop() 竞争消费
+                    ▼
+          ┌───────────┬───────────┬───────────┬───────────┬───────────┐
+          │  Worker 0 │  Worker 1 │  Worker 2 │  Worker 3 │  Worker 4 │
+          └───────────┴───────────┴───────────┴───────────┴───────────┘
+               │             │             │             │             │
+               ▼             ▼             ▼             ▼             ▼
+    local HashMap  local HashMap  local HashMap  local HashMap  local HashMap
+    (key -> task)  (key -> task)  (key -> task)  (key -> task)  (key -> task)
+```
+
+**问题**：同一聚合键 `(None, "channel-123", 1)` 的多条消息，由于 5 个 worker 从同一个队列 `Q` 中竞争 `try_pop()`，**消息 A 可能被 Worker 0 拿到，消息 B 被 Worker 1 拿到**——它们最终进入不同的 local HashMap，无法被合并到同一批次。
+
+后果：
+- 防抖合并效果被削弱，极端情况下每条消息可能独占一个批次
+- 同一频道的 `add_mention_to_unread` 会被拆成多次 MongoDB `$push` 操作
+- 对 `AckMessage`（ack 覆盖语义）无影响，因为每次都是最新值覆盖
+
+**设计权衡**：5 worker 提高了消费吞吐量，但牺牲了同键合并率。这是吞吐与合并效率的取舍。
+
+---
+
+### 10.3.2 AckMessage 分支在本仓库为死路径
+
+**文件**: [ack.rs#L53-L59 (queue_ack)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L53-L59)
+
+```rust
+pub async fn queue_ack(channel: String, user: String, event: AckEvent) {
+    Q.try_push(Data {
+        channel,
+        user: Some(user),   // ← AckMessage 入队时 user 为 Some
+        event,
+    })
+    .ok();
+}
+```
+
+全局搜索 `queue_ack(` 在整个仓库中只有一处——**它自身的定义**，没有任何调用方。
+
+这意味着：
+- `AckEvent::AckMessage` 变体在本仓库中永远不会被入队到 `Q`
+- `handle_ack_event` 的 `AckMessage` 分支在本仓库中是**死代码**
+- 它只可能被外部服务（如 crond）通过 AMQP 直接投递到 ack worker 的内部队列——但当前 ack worker 只消费本地 `Q`，不监听 AMQP
+
+为什么会这样？因为用户 ack 的实际处理路径已经从本地 ack worker 转移到了外部 crond 服务。`AckMessage` 分支是遗留代码。
 
 ### 10.4 Mass mention 立即冲刷
 
@@ -1083,7 +1175,7 @@ if new_event.1.contains_mass_push_mention() {
 2. `task.run_immediately()` — 重置 `start_time` 为 0，让下一秒的扫描立即捕获该任务
 3. `continue` — 不执行后续的 `delay()` 和上限检查
 
-**设计意图**：mass mention 涉及大量用户，需要尽快推送通知，不希望被防抖延迟。`run_immediately()` 确保了即使当前批次还没到 500ms，包含 mass mention 的消息也会在下一轮扫描（≤1 秒）中被处理。
+**设计意图**：mass mention 涉及大量用户，需要尽快推送通知，不希望被防抖延迟。`run_immediately()` 确保了即使当前批次还没到 5 秒静默窗口，包含 mass mention 的消息也会在下一轮扫描（≤1 秒）中被处理。
 
 **注意**：`continue` 跳过了上限检查，所以 mass mention 消息**不受 `process_message_delay_limit` 批次上限约束**——哪怕当前批次已经超过上限，mass mention 仍然会被追加并立即冲刷。
 
@@ -1116,7 +1208,7 @@ if (existing.length() as u16)
 
 ### 10.6 队列满静默丢弃
 
-**文件**: [ack.rs#L53-L59 (queue_ack)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L53-L59) 与 [ack.rs#L69-L75 (queue_message)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L69-L75)
+**文件**: [ack.rs#L69-L75 (queue_message)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L69-L75)
 
 ```rust
 pub async fn queue_message(channel: String, event: AckEvent) {
@@ -1133,16 +1225,21 @@ pub async fn queue_message(channel: String, event: AckEvent) {
 `Q` 是 `deadqueue::limited::Queue<Data>`，容量 10,000。`try_push` 在队列满时返回 `Err`，`.ok()` 直接吞掉错误。
 
 **后果**：
-- 高负载下，队列超过 10,000 条时，新的 `ProcessMessage`（未读写入 + 推送）和 `AckMessage`（ack 处理）会被**静默丢弃**
-- 未读记录丢失、推送不发送、ack 不生效
+- 高负载下，队列超过 10,000 条时，新的 `ProcessMessage`（未读写入 + 推送）会被**静默丢弃**
+- `AckMessage` 永远不会走这条路径（因为 `queue_ack` 没有调用方，见 10.3.2 节）
+- 未读记录丢失、推送不发送
 - 没有日志记录丢弃了多少消息（只有 `info!` 日志记录当前队列占用率）
 
+---
+
 ### 10.7 用户 ack 反向 amqp 清移动端推送回路
+
+> **更正说明**：之前描述的"crond → 消费后回到本进程 `AckMessage` 分支是错误的。实际路径是：**crond 自己写库并自己调 pushd 清推送**，整个 ack worker 的 `AckMessage` 是死代码。
 
 这是完整的 ack 回路：
 
 ```
-客户端 (WebSocket / HTTP)
+客户端 (HTTP/WS)
   │
   ├─ PUT /channels/<target>/ack/<message_id>
   │   [channel_ack.rs#L15-L36]
@@ -1155,16 +1252,29 @@ pub async fn queue_message(channel: String, event: AckEvent) {
   │           │   (幂等：值变化才继续)
   │           └─ amqp.process_ack(user_id, Some(channel_id), None)
   │               [amqp.rs#L348-L381]
-  │               └─ 发布到 process_ack AMQP channel
+  │               └─ 发布到 rabbit.queues.acks 队列
   │
-  └─ WebSocket ChannelAck event
-       [websocket.rs listener]
-       └─ (同 HTTP 路径)
-          └─ acker::ack_channel
-              └─ amqp.process_ack
+  └─ PUT /servers/<target>/ack (服务器级 ack)
+       [server_ack.rs#L15-L32]
+       └─ acker::ack_server(user, server, db, amqp)
+           [acker.rs#L26-L77]
+           └─ 遍历所有频道：
+              ├─ 检查 ViewChannel 权限
+              ├─ 取 channel.last_message_id
+              ├─ Redis GETSET 去重
+              └─ amqp.process_ack(user_id, Some(channel_id), Some(server_id))
 ```
 
-**amqp.process_ack** 发布到 `rabbit.queues.acks` 队列，由 crond（定时任务服务）消费，最终走回 ack worker 的 `AckMessage` 分支：
+**两个 ack 入口**：
+1. **频道级 ack** ([acker.rs#L7-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L7-L24)) — `ack_channel` 单频道 ack
+2. **服务器级 ack** ([acker.rs#L26-L77](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L26-L77)) — `ack_server` 遍历服务器所有可查看频道批量 ack
+
+`amqp.process_ack` 发布到 `rabbit.queues.acks` 队列，由外部 **crond** 消费。crond 收到 ack 事件后：
+1. 自己调用 `db.acknowledge_message` 写 MongoDB（`$pull mentions` + `$set last_id`）
+2. 自己调用 `amqp.ack_notification_message` 发布到 pushd 清移动端推送
+3. **不会**把事件回传给本进程的 ack worker
+
+**`AckMessage` 分支（死代码确认）**：
 
 **文件**: [ack.rs#L92-L118 (handle_ack_event::AckMessage)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L92-L118)
 
@@ -1182,6 +1292,11 @@ AckEvent::AckMessage { id } => {
     }
 }
 ```
+
+这段代码在本仓库中**永远不会被执行**，因为：
+- `queue_ack` 没有任何调用方
+- 外部 crond 不向本进程的 `Q` 队列投递
+- crond 自己完成了所有 ack 的 DB 写入和推送清除工作
 
 **文件**: [amqp.rs#L260-L299 (ack_notification_message)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/amqp/amqp.rs#L260-L299)
 
@@ -1203,25 +1318,93 @@ pub async fn ack_notification_message(user_id, channel_id, message_id) {
 }
 ```
 
-**完整回路总结**：
+**完整正确回路总结**：
 
 ```
 用户 ack (HTTP/WS)
   │
   ▼
-channel.ack()
+channel.ack() / server_ack()
   ├─ EventV1::ChannelAck (跨设备同步)
-  └─ acker::ack_channel
+  └─ acker::ack_channel / acker::ack_server
       ├─ Redis GETSET 去重
-      └─ amqp.process_ack → crond 消费 → ack worker AckMessage
-          ├─ db.acknowledge_message (写 MongoDB：$pull mentions + $set last_id)
-          └─ amqp.ack_notification_message → pushd 消费
-              └─ 清除 iOS 徽章 / 移动端推送
+      └─ amqp.process_ack → crond 消费 (外部进程)
+                                    ├─ db.acknowledge_message (写 MongoDB)
+                                    └─ amqp.ack_notification_message → pushd 消费
+                                                         └─ 清除 iOS 徽章 / 移动端推送
 ```
 
 **关键点**：
-- `amqp.process_ack` 不是直接操作数据库，而是把 ack 事件交给 crond 做可靠异步处理
-- 只有当 `mentions_acked > 0`（真的清除了 mention）时才发 `ack_notification_message`
+- `amqp.process_ack` 不是直接操作数据库，而是把 ack 事件交给外部 crond 做可靠异步处理
+- crond 自己完成 DB 写入和推送清除，**不**回传本进程
+- 服务器级 ack 会遍历所有可查看频道，批量调用 `amqp.process_ack`，每个频道都带 `server_id` 参数
 - `x-deduplication-header` 用 `user_id-channel_id` 做 AMQP 级别的去重，pushd 会合并同一用户同一频道的 ack
 - Redis GETSET 的幂等 + AMQP 去重 = 两层保障，避免重复处理相同 ack
+- `AckMessage` 分支 + `queue_ack` 函数是遗留代码，在本仓库中从未执行
+- 本地 ack worker 只处理 `ProcessMessage`（消息发送时的未读写入和推送通知）
+
+---
+
+### 10.8 服务器级 ack 入口
+
+**文件**: [server_ack.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/delta/src/routes/servers/server_ack.rs)
+
+```rust
+#[put("/<target>/ack")]
+pub async fn ack(db, amqp, user, target) -> Result<EmptyResponse>
+```
+
+处理逻辑在 [acker.rs#L26-L77 (ack_server)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L26-L77):
+
+1. 遍历服务器所有频道列表
+2. 对每个频道检查 `ViewChannel` 权限
+3. 只处理 `TextChannel` 类型（`unreachable!()` 排除其他类型）
+4. 取 `channel.last_message_id` 作为 ack 目标消息 ID
+5. Redis `GETSET` 幂等去重
+6. 调用 `amqp.process_ack(user_id, Some(channel_id), Some(&server.id))`
+7. 发送 `EventV1::ChannelAck` 私有事件同步用户其他设备
+
+与频道级 ack 的区别：
+- 服务器级 ack 每次传 `server_id` 参数（标识 ack 的上下文是服务器级）
+- 遍历所有频道，而不是单条消息
+- ack 目标是 `channel.last_message_id`，不是用户指定的 message_id
+- 只 ack `TextChannel`，DM/Group 等直接 `unreachable!()`
+
+注意如果服务器包含非 TextChannel 时 `unreachable!()` 实际上可能 panic，理论上不会发生，因为服务器只包含 TextChannel 类型
+
+---
+
+## 十一、本批更正汇总表
+
+本次分析共更正 6 处之前的错误理解，对照源码验证如下：
+
+| # | 错误理解 | 正确结论 | 源码依据 |
+|---|---|---|---|
+| 1 | 防抖窗口是 500ms | 5 秒静默（`SAVE_CONSTANT`） + 30 秒硬上限（`EXPIRE_CONSTANT`） | [mod.rs#L34-L66](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/mod.rs#L34-L66) |
+| 2 | 只有 1 个 ack worker | 启动 5 个 worker（`WORKER_COUNT = 5`），共享静态 `Q` 队列但各自持局部 HashMap，同键消息会被分裂到不同 worker | [mod.rs#L8-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/mod.rs#L8-L24) |
+| 3 | 用户 ack 投递到 `amqp.process_ack` 后由 crond 消费再回传本进程 `AckMessage` 分支 | crond 自己写库 + 自己调 `amqp.ack_notification_message` 清推送，**不回传**本进程 | [amqp.rs#L347-L381](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/amqp/amqp.rs#L347-L381) |
+| 4 | `AckMessage` 分支是活跃路径 | 本仓库中 `queue_ack` 无任何调用方，`AckMessage` 是**死代码** | 全局搜索 `queue_ack(` 仅 1 处定义 |
+| 5 | 只有频道级 ack 入口 | 还有服务器级 `ack_server`，遍历服务器所有可查看频道批量 ack，每个频道传 `server_id` 参数 | [acker.rs#L26-L77](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L26-L77)、[server_ack.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/delta/src/routes/servers/server_ack.rs) |
+| 6 | mass mention 是下轮扫描 ≤500ms 处理 | mass mention 下轮扫描 ≤1 秒处理（worker 每秒扫描一次 + `run_immediately()`），且跳过批次上限检查 | [ack.rs#L268-L273](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L268-L273) |
+
+### 关键架构设计总结
+
+```
+消息发送侧 (本进程)                      ack 处理侧 (外部 crond)
+┌──────────────────────────────┐        ┌──────────────────────────────┐
+│  queue_message → ProcessMessage │        │  amqp.process_ack → 写库 + 清推送 │
+│  → 本地 ack worker 5 实例         │        │  → 不回传本进程                 │
+│  → 本地写未读 + AMQP 推送          │        │  AckMessage 分支: 死代码       │
+│  (防抖合并: 5s / 30s)            │        │                              │
+└──────────────────────────────┘        └──────────────────────────────┘
+
+              Q 队列 (10,000 容量)
+                │ 5 个 worker 竞争 try_pop()
+                ▼
+       ┌───┬───┬───┬───┬───┐
+       │ W0│ W1│ W2│ W3│ W4│   ← 每个 worker 有独立 HashMap
+       └───┴───┴───┴───┴───┘
+         同键消息可能分裂到不同 worker
+```
+
 
