@@ -8,6 +8,10 @@
 4. **Rejected / Resolved 状态在当前仓库中没有任何写入代码**——`AbstractReport` trait 只有 `insert_report` 一个方法，不存在 `update_report` / `fetch_report` 等方法；delta 路由中没有管理后台 API；也没有 admin panel 相关代码。状态流转的设计责任归属于独立的管理后台服务（尚未实现）。
 5. **举报入库没有任何事务保障**——`report_content()` 中包含 4 类独立写入操作（附件标记、快照写入、报告写入、Redis 事件发布），彼此独立执行，无 MongoDB 事务包裹，无任何回滚机制。
 6. **失败时会产生多种孤儿数据**——附件可能被永久标记为 reported 但无对应报告、snapshots 可能存在但 report_id 指向不存在的报告、事件发布失败导致数据完整但通知丢失。
+7. **`safety_strikes` 集合是空壳**——只有迁移脚本创建集合和索引，没有对应的 Rust 模型、没有 Abstract trait、没有数据库操作方法、没有 API 路由。处罚体系完全未实现。
+8. **`safety/report` 路由有限流保护**——限流桶名 `safety_report`，阈值 3 次/周期。另有通用 `safety` 桶 15 次/周期。
+9. **`reported` 字段被写入但从未被读取使用**——`mark_attachment_as_reported` 将 `reported: true` 写入附件，但全代码库没有任何下游分支根据 `reported` 字段做逻辑判断。该字段是死字段。
+10. **`generate_from_message` 抓取上下文时没有读权限校验**——用户可以举报任意频道的任意消息（只要知道 message_id），快照会抓取该频道前后各 15 条消息，无论举报人是否有权限访问该频道。这是一个越权读取漏洞。
 
 ---
 
@@ -691,6 +695,357 @@ crond 有 `prune_dangling_files` 任务用于清理悬空附件，但：
 
 ---
 
+## 十一、safety_strikes 集合状态分析
+
+### 11.1 现状：只有集合定义，没有任何代码对接
+
+`safety_strikes` 集合在迁移脚本中被创建，但**没有任何 Rust 代码与它交互**。
+
+| 层面 | 是否存在 | 代码位置 |
+|------|---------|---------|
+| 集合创建 | ✅ 有 | [init.rs:L79-L81](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/admin_migrations/ops/mongodb/init.rs#L79-L81) |
+| 迁移脚本 | ✅ 有 | revision 21 创建集合，revision 22 添加 `moderator_id` 字段 |
+| Rust 模型 struct | ❌ 无 | 全代码库无 `Strike` / `SafetyStrike` 结构体 |
+| Abstract trait | ❌ 无 | 无 `AbstractStrike` trait |
+| 数据库 ops 实现 | ❌ 无 | 无 MongoDB / Reference 操作实现 |
+| API 路由 | ❌ 无 | 无任何创建/查询/更新 strike 的路由 |
+| 事件 | ❌ 无 | 无 `StrikeCreate` / `StrikeUpdate` 等事件变体 |
+
+### 11.2 迁移脚本中的线索
+
+[scripts.rs:L688-L708](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/admin_migrations/ops/mongodb/scripts.rs#L688-L708) 提供了一些设计意图线索：
+
+- **Revision 21** (2023-05-31)：创建 `safety_strikes` 集合
+- **Revision 22** (2023-05-31)：为所有文档补充 `moderator_id` 字段
+
+从 `moderator_id` 字段名可以推断，strike 的设计意图是：
+- 每个 strike 记录一次用户违规处罚
+- `moderator_id` 记录执行处罚的管理员
+- 与安全报告（safety_reports）联动，结案后对用户执行 strike
+
+### 11.3 设计意图推断
+
+```
+  安全报告 (safety_reports)           处罚记录 (safety_strikes)
+  ┌─────────────────────────┐        ┌─────────────────────────┐
+  │ id: 报告ID               │        │ id: 处罚ID              │
+  │ author_id: 举报人        │ 结案后  │ user_id: 被处罚用户     │
+  │ content: 被举报内容      │ ──────▶ │ reason: 处罚原因        │
+  │ status: Created          │  触发   │ moderator_id: 执行者    │
+  │ notes: 管理员备注        │        │ created_at: 处罚时间     │
+  └─────────────────────────┘        └─────────────────────────┘
+           ▲                                       │
+           │                                       │
+      用户举报                              用户状态变更
+      （已实现）                             （未实现）
+```
+
+**当前状态**：只有左边的举报输入，没有右边的处罚输出。报告创建后永远停留在 `Created` 状态，没有任何机制将其转化为 strike 处罚。
+
+### 11.4 责任归属
+
+与 `ReportStatus` 的状态流转一样，`safety_strikes` 的操作代码也应归属于**独立的管理后台服务**。本仓库（revolt-backend）只负责数据存储层和用户端的举报入口。
+
+---
+
+## 十二、safety/report 路由的限流桶与阈值
+
+### 12.1 限流配置位置
+
+限流定义在 [ratelimits.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/util/ratelimits.rs) 的 `DeltaRatelimits` 实现中。
+
+### 12.2 限流解析逻辑
+
+`resolve_bucket()` 方法根据 HTTP 请求的路径段和方法决定限流桶：
+
+```rust
+match (segment, resource, method) {
+    // ...
+    ("safety", Some("report"), _) => ("safety_report", Some("report")),
+    ("safety", _, _) => ("safety", None),
+    // ...
+}
+```
+
+| 路由路径 | 桶名 | 资源 ID |
+|---------|------|--------|
+| `POST /safety/report` | `safety_report` | `"report"`（固定） |
+| 其他 `/safety/*` 路由 | `safety` | `None` |
+
+### 12.3 限流阈值
+
+`resolve_bucket_limit()` 方法定义各桶的阈值：
+
+| 桶名 | 阈值 | 说明 |
+|------|------|------|
+| `safety_report` | **3** | 创建举报的限流，非常严格 |
+| `safety` | 15 | 其他安全相关 API 的通用桶 |
+| `messaging` | 10 | 发消息的限流（对比参考） |
+| `auth` | 15 | 认证相关限流 |
+| `any` | 20 | 默认桶 |
+
+**注意**：`safety_report` 桶的阈值（3）远低于发消息的阈值（10），说明设计上对举报行为有更严格的频率控制，防止恶意刷屏式举报。
+
+### 12.4 限流实现机制
+
+限流基于 `revolt_ratelimits` crate，使用 Redis 存储计数器。从 `ratelimit_events` 模型可推断：
+
+- 每个桶 + 用户/IP 对应一个计数器
+- 有时间窗口（滑动或固定窗口）
+- 超过阈值返回 429 错误
+
+### 12.5 潜在问题
+
+1. **资源 ID 固定为 "report"**：`Some("report")` 是硬编码的字符串，不是动态的。这意味着限流是按**全局**计算的，不是按每个被举报对象计算。用户 A 举报用户 X 和举报用户 Y 都消耗同一个 `safety_report` 桶的额度。
+
+2. **阈值较低**：3 次/周期的阈值对于正常使用可能偏紧，但对于防止恶意举报是合理的。
+
+---
+
+## 十三、mark_attachment_as_reported 字段的下游读取分析
+
+### 13.1 写入位置
+
+`mark_attachment_as_reported()` 方法将 `reported: true` 写入 `attachments` 集合：
+
+- MongoDB 实现：[files/ops/mongodb.rs:L121-L136](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/files/ops/mongodb.rs#L121-L136)
+- Reference 实现：[files/ops/reference.rs:L95-L101](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/files/ops/reference.rs#L95-L101)
+
+### 13.2 字段定义
+
+File 模型中的 `reported` 字段：
+- 数据库模型：[files/model.rs:L32-L34](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/files/model.rs#L32-L34)
+- API 模型：[v0/files.rs:L21-L23](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/models/src/v0/files.rs#L21-L23)
+
+字段特性：
+- 类型：`Option<bool>`
+- 序列化：`skip_serializing_if = "Option::is_none"`（为 None 时不输出）
+- 含义：文件是否被举报过
+
+### 13.3 下游读取情况排查
+
+全局搜索 `reported` 字段的读取/判断逻辑：
+
+| 代码位置 | 用途 | 是否为业务逻辑判断 |
+|---------|------|-------------------|
+| [bridge/v0.rs:L378](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/util/bridge/v0.rs#L378) | 模型转换（db → v0） | ❌ 只是透传 |
+| [bridge/v0.rs:L397](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/util/bridge/v0.rs#L397) | 模型转换（v0 → db） | ❌ 只是透传 |
+| [files/ops/reference.rs:L45](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/files/ops/reference.rs#L45) | Reference 实现中的条件过滤 | ❌ 仅测试/内存实现 |
+| [files/ops/mongodb.rs:L43](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/files/ops/mongodb.rs#L43) | MongoDB 投影字段 | ❌ 只是查询时包含该字段 |
+| **业务逻辑判断** | — | **零命中** |
+
+### 13.4 结论：reported 是死字段
+
+**`reported` 字段被写入但从未被任何业务逻辑读取使用。** 具体表现：
+
+1. **没有查询过滤**：没有任何 API 根据 `reported=true` 过滤文件列表
+2. **没有条件分支**：没有任何 `if file.reported` 的判断逻辑
+3. **没有管理后台读取**：管理后台尚未实现，自然也没有读取该字段
+4. **序列化透传**：只有模型层的双向转换透传了该字段，但如果文件通过 API 返回给客户端，客户端会看到 `reported` 字段（如果为 true 的话）
+
+### 13.5 设计意图推测
+
+该字段的设计意图应该是：
+
+1. **防止重复举报**：标记已举报的附件，避免重复进入审核流程
+2. **快速筛选**：管理员可以按 `reported=true` 筛选待审核的附件
+3. **状态标记**：作为文件生命周期的一部分（normal → reported → deleted）
+
+但由于管理后台未实现，这些功能都不存在。当前只有"写入"，没有"读取"和"使用"。
+
+### 13.6 安全隐患
+
+虽然 `reported` 字段本身是死字段，但结合之前的孤儿数据分析：
+
+- 举报失败时附件可能被永久标记为 `reported=true`
+- 由于没有读取逻辑，这些"假阳性"标记不会被发现
+- 如果未来管理后台实现了按 `reported` 筛选，会出现大量无对应报告的孤儿标记
+
+---
+
+## 十四、generate_from_message 的权限校验漏洞
+
+### 14.1 正常消息获取的权限校验
+
+作为对比，标准的消息获取 API [message_fetch.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/channels/message_fetch.rs#L14-L33) 有严格的权限校验：
+
+```rust
+// 1. 获取频道
+let channel = target.as_channel(db).await?;
+
+// 2. 计算频道权限
+let mut query = DatabasePermissionQuery::new(db, &user).channel(&channel);
+calculate_channel_permissions(&mut query)
+    .await
+    .throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
+
+// 3. 获取消息并校验归属
+let message = msg.as_message(db).await?;
+if message.channel != channel.id() {
+    return Err(create_error!(NotFound));
+}
+```
+
+三步校验：频道存在 → 有权限 → 消息属于该频道。
+
+### 14.2 举报路由的权限校验缺失
+
+而在 [report_content.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/safety/report_content.rs#L47-L56) 的消息举报逻辑中：
+
+```rust
+ReportedContent::Message { id, .. } => {
+    let message = db.fetch_message(id).await?;  // 直接按 ID 取消息！
+
+    // Users cannot report themselves
+    if message.author == user.id {
+        return Err(create_error!(CannotReportYourself));
+    }
+
+    let (snapshot, files) = SnapshotContent::generate_from_message(db, message).await?;
+    (vec![snapshot], files)
+}
+```
+
+**只有一步校验**：不能举报自己的消息。
+
+**缺少的校验**：
+1. ❌ 不校验消息所在的频道是否存在
+2. ❌ 不校验用户是否有 `ViewChannel` 权限
+3. ❌ 不校验用户是否能访问该服务器/频道
+4. ❌ 不校验消息是否属于用户可见的频道
+
+### 14.3 漏洞影响：越权读取消息上下文
+
+更严重的是，`generate_from_message()` 会抓取消息前后各 **15 条** 上下文消息：
+
+```rust
+// 抓取之前的 15 条
+let prior_context = db.fetch_messages(MessageQuery {
+    filter: MessageFilter {
+        channel: Some(message.channel.to_string()),
+        ..Default::default()
+    },
+    limit: Some(15),
+    time_period: MessageTimePeriod::Absolute {
+        before: Some(message.id.to_string()),
+        ...
+    },
+}).await?;
+
+// 抓取之后的 15 条
+let leading_context = db.fetch_messages(MessageQuery {
+    filter: MessageFilter {
+        channel: Some(message.channel.to_string()),
+        ..Default::default()
+    },
+    limit: Some(15),
+    time_period: MessageTimePeriod::Absolute {
+        after: Some(message.id.to_string()),
+        ...
+    },
+}).await?;
+```
+
+**攻击路径**：
+
+```
+攻击者（无权限访问私密频道 X）
+   │
+   │  知道/猜到频道 X 中的某条消息 ID
+   │
+   ▼
+POST /safety/report
+{ content: { type: "Message", id: "消息ID" } }
+   │
+   ▼
+delta 直接 fetch_message(id) → 成功获取消息内容
+   │
+   ▼
+generate_from_message() → 抓取频道 X 中前后各 15 条消息
+   │
+   ▼
+31 条私密消息被存入 safety_snapshots 快照中
+   │
+   ▼
+虽然攻击者看不到返回结果（只有 204 No Content），
+但如果快照能通过其他途径读取（如管理后台漏洞），
+就能获取大量私密信息
+```
+
+### 14.4 漏洞严重程度评估
+
+| 维度 | 评估 |
+|------|------|
+| 可利用性 | 高 —— 只需知道 message_id 即可发起 |
+| 信息泄露量 | 中 —— 31 条消息，约一个屏幕的聊天内容 |
+| 直接危害 | 低 —— 攻击者无法直接读取返回（API 返回 204） |
+| 间接危害 | 中 —— 快照永久存储，若管理后台有泄露则放大 |
+| 修复成本 | 低 —— 添加几行权限校验即可 |
+
+### 14.5 用户举报场景的校验缺失
+
+除了消息举报，**用户举报** 场景也有类似问题：
+
+```rust
+ReportedContent::User { id, message_id, .. } => {
+    let reported_user = db.fetch_user(id).await?;  // 直接按 ID 取用户
+    // 只校验了不能举报自己
+    if reported_user.id == user.id {
+        return Err(create_error!(CannotReportYourself));
+    }
+
+    // 如果提供了 message_id，也会抓取该消息的快照
+    let message = if let Some(id) = message_id {
+        db.fetch_message(id).await.ok()  // 注意这里用了 .ok()，失败静默
+    } else {
+        None
+    };
+    // ...
+}
+```
+
+用户信息本身通常是公开的（头像、用户名等），所以越权读取用户资料的危害不大。但附带的 `message_id` 同样存在消息越权读取问题。
+
+### 14.6 服务器举报场景
+
+服务器举报场景：
+```rust
+ReportedContent::Server { id, .. } => {
+    let server = db.fetch_server(id).await?;
+    if server.owner == user.id {  // 只校验了不能举报自己的服务器
+        return Err(create_error!(CannotReportYourself));
+    }
+    let (snapshot, files) = SnapshotContent::generate_from_server(server)?;
+    // ...
+}
+```
+
+服务器信息（名称、图标、描述等）通常是公开的，即使是私密服务器，基本信息也可能通过搜索等途径暴露。所以服务器举报的越权问题相对较轻。
+
+### 14.7 修复建议
+
+**核心修复点**：在 `report_content()` 中，对被举报内容进行权限校验，确保举报人有权访问。
+
+具体措施：
+
+1. **消息举报**：
+   - 通过 `channel_id` 获取频道
+   - 计算用户在该频道的权限
+   - 确保有 `ViewChannel` 权限才允许举报和生成快照
+
+2. **服务器举报**：
+   - 校验用户是否是服务器成员（或服务器是公开的）
+
+3. **快照生成**：
+   - 上下文消息抓取也应在权限校验通过后进行
+   - 或在 `generate_from_message` 内部增加权限校验参数
+
+4. **深度防御**：
+   - 快照数据不应包含完整的消息内容元数据
+   - 管理后台查看快照时应再次校验管理员权限
+
+---
+
 ## 六、附录：代码引用索引
 
 | 组件 | 文件 | 关键行 |
@@ -714,8 +1069,16 @@ crond 有 `prune_dangling_files` 任务用于清理悬空附件，但：
 | generate_ready_payload | [impl.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/impl.rs) | L98-L332 |
 | 事件处理分支 | [impl.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/impl.rs) | L434-L696 |
 | mark_attachment_as_reported | [files/ops/mongodb.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/files/ops/mongodb.rs) | L121-L136 |
+| 文件 reported 字段 | [files/model.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/files/model.rs) | L32-L34 |
+| 文件 reported (v0) | [v0/files.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/models/src/v0/files.rs) | L21-L23 |
+| reported 桥接转换 | [bridge/v0.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/util/bridge/v0.rs) | L378, L397 |
 | MongoDB 事务使用示例 | [server_members/ops/mongodb.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/server_members/ops/mongodb.rs) | 事务相关 |
 | AMQP 8 通道 | [amqp.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/amqp/amqp.rs) | L18-L29 |
 | pushd 消费者 | [pushd/main.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/daemons/pushd/src/main.rs) | L28-L219 |
 | crond 任务 | [crond/main.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/daemons/crond/src/main.rs) | L10-L23 |
 | delta 启动 | [delta/main.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/main.rs) | L33-L97 |
+| 限流配置 | [ratelimits.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/util/ratelimits.rs) | L1-L81 |
+| 正常消息获取权限校验 | [message_fetch.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/channels/message_fetch.rs) | L14-L33 |
+| generate_from_message | [safety_snapshots/model.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/safety_snapshots/model.rs) | L42-L93 |
+| safety_strikes 集合创建 | [init.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/admin_migrations/ops/mongodb/init.rs) | L79-L81 |
+| safety_strikes 迁移脚本 | [scripts.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/admin_migrations/ops/mongodb/scripts.rs) | L688-L708 |
