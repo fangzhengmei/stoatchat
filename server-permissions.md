@@ -478,18 +478,488 @@ EventV1::ServerRoleDelete {
 
 ---
 
-## 八、关键代码索引
+## 九、两条权限计算路径的深度对比
+
+系统中存在两条独立的权限计算路径：**单用户 trait 路径**和**批量同步路径**。两者计算结果在服务器级应该一致，但在频道级和后处理阶段存在结构性差异。
+
+### 9.1 架构对比总览
+
+| 维度 | 单用户 trait 路径 | 批量同步路径 |
+|---|---|---|
+| 入口结构 | `DatabasePermissionQuery` | `BulkDatabasePermissionQuery` |
+| 计算函数 | `calculate_server_permissions::<P: PermissionQuery>` (async, 泛型) | `calculate_server_permissions(server, user, member)` (sync, 具体类型) |
+| 服务器级计算 | 通过 trait 方法间接获取数据 | 直接引用 `&Server`, `&User`, `&Member` |
+| 频道级计算 | `calculate_channel_permissions` 支持全部 5 种频道类型 | `calculate_members_permissions` 仅支持 `TextChannel`，其他类型直接 panic |
+| 数据获取 | 按需异步拉取（lazy fetch） | 前置批量拉取（eager fetch） |
+| 语音开关 | ✅ 服务器级检查 `can_publish` / `can_receive` | ❌ **缺失** |
+| 频道级 Timeout | ✅ `ServerChannel` 分支中二次检查 | ❌ **缺失** |
+| ViewChannel 守卫 | ✅ 无 `ViewChannel` 则 `revoke_all()` | ❌ **缺失** |
+| 成员身份未知时 | 自动从 DB 补拉成员 | 直接判 0 |
+
+### 9.2 两条路径的 `calculate_server_permissions` 逐行对比
+
+**单用户 trait 版本** — [impl.rs#L49-L78](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L49-L78)：
+
+```rust
+pub async fn calculate_server_permissions<P: PermissionQuery>(query: &mut P) -> PermissionValue {
+    // ① 特权 OR 服务器拥有者 → GrantAllSafe
+    if query.are_we_privileged().await || query.are_we_server_owner().await { ... }
+    // ② 非成员 → 0
+    if !query.are_we_a_member().await { ... }
+    // ③ 取默认权限
+    let mut permissions = query.get_default_server_permissions().await.into();
+    // ④ 依次 apply 角色覆盖
+    for role_override in query.get_our_server_role_overrides().await { permissions.apply(role_override); }
+    // ⑤ 语音开关
+    if !query.do_we_have_publish_overwrites().await { revoke(Speak+Video); }
+    if !query.do_we_have_receive_overwrites().await { revoke(Listen); }
+    // ⑥ Timeout
+    if query.are_we_timed_out().await { permissions.restrict(*ALLOW_IN_TIMEOUT); }
+    permissions
+}
+```
+
+**批量同步版本** — [bulk_permissions.rs#L316-L345](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L316-L345)：
+
+```rust
+fn calculate_server_permissions(server: &Server, user: &User, member: &Member) -> PermissionValue {
+    // ① 特权 OR 服务器拥有者 → GrantAllSafe
+    if user.privileged || server.owner == user.id { ... }
+    // ② 无（调用方已保证成员存在）
+    // ③ 取默认权限
+    let mut permissions: PermissionValue = server.default_permissions.into();
+    // ④ 依次 apply 角色覆盖
+    let mut roles = server.roles.iter().filter(...).map(...).collect();
+    roles.sort_by(|a, b| b.0.cmp(&a.0));
+    for role in role_overrides { permissions.apply(role); }
+    // ⑤ 语音开关 — ❌ 缺失
+    // ⑥ Timeout
+    if member.in_timeout() { permissions.restrict(*ALLOW_IN_TIMEOUT); }
+    permissions
+}
+```
+
+**差异汇总**：
+
+| 步骤 | trait 版本 | 批量版本 | 差异 |
+|---|---|---|---|
+| 特权判断 | `are_we_privileged()` | `user.privileged` | 等价 |
+| 拥有者判断 | `are_we_server_owner()` | `server.owner == user.id` | 等价 |
+| 成员检查 | `are_we_a_member()` 可能补拉 | 调用方已过滤 | 批量版不做（外层保证） |
+| 角色排序 | trait 内 `get_our_server_role_overrides` | 内联排序逻辑 | 等价 |
+| 语音开关 | ✅ 检查 `can_publish`/`can_receive` | ❌ **完全缺失** | **行为差异** |
+| Timeout | ✅ | ✅ | 等价 |
+
+### 9.3 频道级计算的差异
+
+单用户路径的 `calculate_channel_permissions` 在 `ServerChannel` 分支中（[impl.rs#L119-L144](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L119-L144)）执行了三步后处理：
+
+1. **Timeout 二次检查**：即使服务器级已 restrict，频道级再次 `restrict(*ALLOW_IN_TIMEOUT)`
+2. **ViewChannel 守卫**：若无 `ViewChannel` 权限，`revoke_all()` 清零
+
+批量路径的 `calculate_members_permissions`（[bulk_permissions.rs#L256-L310](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L256-L310)）在频道级**都没有**这两个后处理步骤。
+
+这意味着：
+- 批量路径可能返回一个没有 `ViewChannel` 权限但仍有其他权限位的非零值
+- `members_can_see_channel` 通过 `has_channel_permission(ChannelPermission::ViewChannel)` 单独检查弥补了 ViewChannel 守卫的缺失，但其他使用批量权限值的场景可能出问题
+- 批量路径的 Timeout 限制仅在服务器级生效（`calculate_server_permissions` 同步版中），频道级不再二次 restrict——但由于 `restrict` 是 AND 操作，重复执行结果相同，所以实际差异仅在于语音开关的缺失
+
+---
+
+## 十、批量补拉机制：missing_users 与 missing_members
+
+`BulkDatabasePermissionQuery` 的 Builder 模式允许调用方只提供 `users` 或 `members` 其中之一，缺失的另一个维度会在计算时自动补拉。
+
+### 10.1 补拉逻辑
+
+位于 [calculate_members_permissions](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L206-L245)：
+
+```
+调用方提供了 members 但没提供 users:
+  → 从 members 中提取 user_id 列表
+  → database.fetch_users(&ids[..]) 批量拉取
+  → 存入 cached_users 和 users
+
+调用方提供了 users 但没提供 members:
+  → 从 users 中提取 user_id 列表
+  → database.fetch_members(&server.id, &ids[..]) 批量拉取
+  → 存入 cached_members 和 members
+```
+
+### 10.2 双缓存设计
+
+```rust
+pub struct BulkDatabasePermissionQuery<'a> {
+    users: Option<Vec<User>>,           // 调用方传入或补拉后的用户列表
+    members: Option<Vec<Member>>,       // 调用方传入或补拉后的成员列表
+    pub(crate) cached_users: Option<Vec<User>>,    // 补拉产生的用户数据
+    pub(crate) cached_members: Option<Vec<Member>>, // 补拉产生的成员数据
+    cached_member_perms: Option<HashMap<String, PermissionValue>>, // 权限结果缓存
+}
+```
+
+`cached_users` / `cached_members` 与 `users` / `members` 分开存储，原因：
+- `cached_*` 标记"这些数据是补拉产生的，属于调用方不持有的额外数据"，供外部读取
+- `users` / `members` 是实际计算用的列表
+
+### 10.3 Builder 的互斥约束
+
+[`.members()`](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L112-L121) 和 [`.users()`](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L123-L132) 两个 Builder 方法会**互斥清空**对方：
+
+```rust
+pub fn members(self, members: &'z [Member]) -> BulkDatabasePermissionQuery<'z> {
+    BulkDatabasePermissionQuery {
+        members: Some(members.to_owned()),
+        cached_member_perms: None,
+        users: None,           // ← 清空 users
+        cached_members: None,
+        cached_users: None,
+        ..self
+    }
+}
+
+pub fn users(self, users: &'z [User]) -> BulkDatabasePermissionQuery<'z> {
+    BulkDatabasePermissionQuery {
+        users: Some(users.to_owned()),
+        cached_member_perms: None,
+        members: None,         // ← 清空 members
+        cached_members: None,
+        cached_users: None,
+        ..self
+    }
+}
+```
+
+这确保了不会出现"旧 users + 新 members"的不一致状态。任一 setter 调用后，另一维度必然为 `None`，需要在 `calculate_members_permissions` 中补拉。
+
+### 10.4 成员查找效率
+
+补拉完成后，成员列表被转为 HashMap 以实现 O(1) 查找（[bulk_permissions.rs#L247-L254](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L247-L254)）：
+
+```rust
+let members: HashMap<&String, &Member, RandomState> = HashMap::from_iter(
+    query.members.as_ref().unwrap()
+        .iter()
+        .map(|m| (&m.id.user, m)),
+);
+```
+
+以 `user.id` 为 key，遍历用户列表时快速定位对应成员。如果用户不是服务器成员（`members.get(&user.id)` 返回 `None`），直接赋 0 权限。
+
+---
+
+## 十一、Timeout 和语音开关在两条链路中的位置差异
+
+### 11.1 单用户链路中的完整后处理链
+
+```
+calculate_channel_permissions (ServerChannel 分支)
+  │
+  ├─ calculate_server_permissions (trait 版)
+  │     ├─ 角色叠加完成后
+  │     ├─ ✅ can_publish 检查 → revoke(Speak + Video)
+  │     ├─ ✅ can_receive 检查 → revoke(Listen)
+  │     └─ ✅ Timeout → restrict(ALLOW_IN_TIMEOUT)
+  │
+  ├─ apply 频道默认权限
+  ├─ apply 频道角色覆盖
+  │
+  ├─ ✅ Timeout 二次 restrict(ALLOW_IN_TIMEOUT)    ← 频道级后处理
+  └─ ✅ ViewChannel 守卫 → revoke_all()             ← 频道级后处理
+```
+
+**关键细节**：Timeout 在单用户路径中被检查了两次：
+1. 服务器级（`calculate_server_permissions` 内）：角色叠加后 restrict
+2. 频道级（`calculate_channel_permissions` 的 `ServerChannel` 分支）：频道覆盖后再次 restrict
+
+第二次 restrict 是防御性的——理论上，如果频道覆盖的 allow 包含了 `ViewChannel` 或 `ReadMessageHistory` 之外的权限，第二次 restrict 会将其收回。但由于 `restrict` 是 AND 操作，而第一次 restrict 已经将权限限制到 `ALLOW_IN_TIMEOUT`（只有 ViewChannel + ReadMessageHistory），频道覆盖不可能恢复超出此范围的权限（因为角色的 allow 位中不可能有超出 ALLOW_IN_TIMEOUT 的位被设置——除非角色显式 allow 了其他权限）。**因此第二次 restrict 的实际效果是：即使频道覆盖 allow 了额外权限，Timeout 成员仍无法获得。**
+
+### 11.2 批量链路中的后处理链
+
+```
+calculate_members_permissions
+  │
+  ├─ calculate_server_permissions (同步版)
+  │     ├─ 角色叠加完成后
+  │     ├─ ❌ 无 can_publish / can_receive 检查
+  │     └─ ✅ Timeout → restrict(ALLOW_IN_TIMEOUT)
+  │
+  ├─ apply 频道默认权限
+  ├─ apply 频道角色覆盖
+  │
+  ├─ ❌ 无 Timeout 二次 restrict
+  └─ ❌ 无 ViewChannel 守卫
+```
+
+**缺失分析**：
+
+| 缺失项 | 影响 | 是否有外部弥补 |
+|---|---|---|
+| `can_publish` / `can_receive` | 被 mute/deafen 的成员在批量计算中仍获得 Speak/Video/Listen 权限 | `members_can_see_channel` 只检查 ViewChannel，不检查语音权限 |
+| 频道级 Timeout 二次 restrict | Timeout 成员如果频道覆盖 allow 了额外权限，不会被收回 | 无弥补 |
+| ViewChannel 守卫 | 没有 ViewChannel 权限的成员可能返回非零权限值 | `members_can_see_channel` 通过单独检查 ViewChannel 弥补了"可见性判断"场景 |
+
+**结论**：批量路径的 `calculate_members_permissions` 目前仅在 `members_can_see_channel` 中被调用，该方法只需要判断 `ViewChannel` 权限，因此缺失的后处理对当前使用场景影响有限。但如果未来在其他场景复用该函数，需要补齐这些后处理步骤。
+
+---
+
+## 十二、throw_permission_override 位运算拦截机制
+
+### 12.1 拦截逻辑详解
+
+[throw_permission_override](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L92-L113) 是权限委托安全的核心守卫，防止用户将自身不具备的权限授予他人。
+
+```rust
+pub async fn throw_permission_override<C>(
+    &self,                          // self = 操作者当前权限值
+    current_value: C,               // 目标当前的 Override（Option<Override>）
+    next_value: &Override,          // 目标即将设置的 Override
+) -> Result<()>
+where C: Into<Option<Override>>
+```
+
+**两种场景**：
+
+**场景 A：从无到有（current_value = None）**
+
+```rust
+if !self.has(next_value.allows()) {
+    return Err(create_error!(CannotGiveMissingPermissions));
+}
+```
+
+所有即将 allow 的权限位，操作者必须全部拥有。这是最直观的检查：你不能授予你没有的权限。
+
+**场景 B：从旧值变更（current_value = Some(old)）**
+
+```rust
+if !self.has(!current_value.allows() & next_value.allows())
+    || !self.has(current_value.denies() & !next_value.denies())
+{
+    return Err(create_error!(CannotGiveMissingPermissions));
+}
+```
+
+两个条件必须同时满足，否则拦截：
+
+**条件 1**：`!old_allow & new_allow` — 新增的 allow 位
+
+```
+旧值 allow = 0b1010
+新值 allow = 0b1110
+新增 allow = ~0b1010 & 0b1110 = 0b0101 & 0b1110 = 0b0100
+```
+
+新增的 allow 位（从无到有）操作者必须拥有。你不能开放你本身不具备的权限。
+
+**条件 2**：`old_deny & ~new_deny` — 移除的 deny 位
+
+```
+旧值 deny = 0b1100
+新值 deny = 0b1000
+移除 deny = 0b1100 & ~0b1000 = 0b1100 & 0b0111 = 0b0100
+```
+
+移除的 deny 位（从拒绝变为中性/允许）操作者必须拥有。你不能"解禁"你本身不具备的权限——因为解禁等同于授予。
+
+### 12.2 位运算真值表
+
+| 旧 allow | 新 allow | 旧 deny | 新 deny | 含义 | 需要检查 |
+|---|---|---|---|---|---|
+| 0 | 0 | 0 | 0 | 保持中性 | 无需 |
+| 0 | 1 | 0 | 0 | 新增 allow | ✅ 操作者需拥有此位 |
+| 1 | 1 | 0 | 0 | 保持 allow | 无需 |
+| 1 | 0 | 0 | 0 | 撤销 allow | 无需（收权总是允许的） |
+| 0 | 0 | 0 | 1 | 新增 deny | 无需（收权总是允许的） |
+| 0 | 0 | 1 | 1 | 保持 deny | 无需 |
+| 0 | 0 | 1 | 0 | 移除 deny | ✅ 操作者需拥有此位 |
+| 1 | 1 | 1 | 1 | 同时 allow+deny（deny 胜出） | 无需 |
+
+**核心原则**：只有"扩大权限范围"的操作才需要拦截——包括新增 allow 和移除 deny。"缩小权限范围"的操作（新增 deny、撤销 allow）总是允许的。
+
+### 12.3 调用位置
+
+| 路由 | 文件 | 场景 |
+|---|---|---|
+| 服务器角色权限设置 | [permissions_set.rs (server)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/permissions_set.rs#L46-L48) | 修改服务器角色的 allow/deny |
+| 频道角色权限设置 | [permissions_set.rs (channel)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/channels/permissions_set.rs#L36-L39) | 修改频道角色的 allow/deny |
+| 频道默认权限设置 | [permissions_set_default.rs (channel)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/channels/permissions_set_default.rs#L53-L55) | 修改频道默认的 allow/deny |
+| 服务器默认权限设置 | [permissions_set_default.rs (server)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/permissions_set_default.rs#L33-L40) | 设置默认权限（从 None 开始） |
+
+---
+
+## 十三、角色 Rank 互锁机制
+
+Rank 互锁是权限系统的层级安全守卫，确保低优先级角色的持有者无法操作高优先级角色。互锁贯穿于角色编辑、角色删除、角色排序、成员编辑四个操作。
+
+### 13.1 互锁基础：Member::get_ranking
+
+[get_ranking](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/server_members/model.rs#L243-L254) 取成员所有角色中的最小 rank 值：
+
+```rust
+pub fn get_ranking(&self, server: &Server) -> i64 {
+    let mut value = i64::MAX;         // 默认最低优先级
+    for role in &self.roles {
+        if let Some(role) = server.roles.get(role) {
+            if role.rank < value {
+                value = role.rank;    // 取最小 rank = 最高优先级
+            }
+        }
+    }
+    value
+}
+```
+
+**无角色成员的 ranking = `i64::MAX`**（最低优先级），拥有 rank=0 角色的成员 ranking=0（最高优先级）。服务器拥有者不经过此计算，直接拥有绝对权限。
+
+### 13.2 互锁在角色删除中的体现
+
+[roles_delete.rs#L29-L38](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_delete.rs#L29-L38)：
+
+```rust
+let member_rank = query.get_member_rank().unwrap_or(i64::MIN);
+let role = server.roles.remove(&role_id).ok_or_else(|| create_error!(NotFound))?;
+if role.rank <= member_rank {
+    return Err(create_error!(NotElevated));
+}
+```
+
+**互锁规则**：`role.rank <= member_rank` 时拒绝。即只能删除 rank **严格大于**自己 ranking 的角色（rank 更大 = 优先级更低）。
+
+`unwrap_or(i64::MIN)` 处理了成员不在服务器中的极端情况——此时 `i64::MIN` 确保几乎所有角色的 rank 都大于它，从而阻止操作。
+
+### 13.3 互锁在角色编辑中的体现
+
+[roles_edit.rs#L38-L44](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_edit.rs#L38-L44)：
+
+```rust
+let member_rank = query.get_member_rank().unwrap_or(i64::MIN);
+if let Some(mut role) = server.roles.remove(&role_id) {
+    if role.rank <= member_rank {
+        return Err(create_error!(NotElevated));
+    }
+    // ... proceed with edit
+}
+```
+
+与删除逻辑完全一致：不能编辑 rank 不高于自己的角色。注意编辑只涉及角色元数据（名称、颜色、图标），不涉及权限修改——权限修改走 `permissions_set` 路由。
+
+### 13.4 互锁在角色排序中的体现
+
+[roles_edit_positions.rs#L45-L69](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_edit_positions.rs#L45-L69)：
+
+```rust
+if server.owner != user.id {
+    let member_top_rank = query.get_member_rank();
+    if server.roles.iter()
+        .filter(|(_, role)| {
+            if let Some(top_rank) = member_top_rank {
+                role.rank <= top_rank      // 找出所有高于或等于自己的角色
+            } else { true }
+        })
+        .any(|(id, _)| {
+            existing_order.iter().position(|x| x == id)
+                != new_order.iter().position(|x| x == id)  // 检查这些角色的位置是否被改变
+        })
+    {
+        return Err(create_error!(NotElevated));
+    }
+}
+```
+
+**互锁规则**：非拥有者不能改变 rank ≤ 自己 ranking 的角色在排序中的位置。这意味着：
+- 你不能把高于你的角色往下挪（降低其优先级）
+- 你不能把低于你的角色往上挪到高于你的位置（提升其优先级）
+- 你只能在自己排名以下的角色之间重新排序
+
+### 13.5 互锁在成员编辑中的双重体现
+
+[member_edit.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/member_edit.rs) 包含两层互锁：
+
+**第一层：目标成员的 ranking 互锁**（[L144-L152](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/member_edit.rs#L144-L152)）
+
+```rust
+let our_ranking = query.get_member_rank().unwrap_or(i64::MIN);
+if member.id.user != user.id
+    && member.get_ranking(query.server_ref().as_ref().unwrap()) <= our_ranking
+{
+    return Err(create_error!(NotElevated));
+}
+```
+
+不能对 ranking 不高于自己的成员执行管理操作。注意这里用的是 `<=`（不是 `<`），即 ranking 相等的成员也不能互操作。
+
+**第二层：角色分配的 rank 互锁**（[L155-L169](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/member_edit.rs#L155-L169)）
+
+```rust
+if let Some(roles) = &data.roles {
+    let added_roles: Vec<&&String> = new_roles.difference(&current_roles).collect();
+    for role_id in added_roles {
+        if let Some(role) = server.roles.remove(*role_id) {
+            if role.rank <= our_ranking {
+                return Err(create_error!(NotElevated));
+            }
+        } else {
+            return Err(create_error!(InvalidRole));
+        }
+    }
+}
+```
+
+只能分配 rank **严格高于**自己 ranking 的角色给他人。这防止了"我给自己或他人添加一个比我当前最高优先级还高的角色"的提权攻击。
+
+**Timeout 的反向互锁**（[L81-L93](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/member_edit.rs#L81-L93)）
+
+```rust
+if data.timeout.is_some() {
+    if member.id.user == user.id {
+        return Err(create_error!(CannotTimeoutYourself));
+    }
+    if target_permissions.has_channel_permission(ChannelPermission::TimeoutMembers) {
+        return Err(create_error!(IsElevated));
+    }
+}
+```
+
+Timeout 操作除了需要 `TimeoutMembers` 权限外，还有反向检查：如果目标成员拥有 `TimeoutMembers` 权限，则不能对其执行 Timeout。这是一种"同级保护"——拥有管理权限的成员不能被互相 Timeout。
+
+### 13.6 Rank 互锁全景图
+
+```
+操作               互锁检查                              代码位置
+─────────────────────────────────────────────────────────────────────
+删除角色           role.rank > member_rank              roles_delete.rs#L37
+编辑角色           role.rank > member_rank              roles_edit.rs#L42
+角色排序           不能移动 rank ≤ 自己的角色的位置      roles_edit_positions.rs#L48-L68
+成员编辑(总)       target_ranking > our_ranking          member_edit.rs#L148-L152
+成员编辑(角色)     added_role.rank > our_ranking         member_edit.rs#L161-L165
+成员编辑(Timeout)  目标不能有 TimeoutMembers 权限        member_edit.rs#L87-L89
+权限设置(服务器)   role.rank > member_rank              permissions_set(server)#L40
+权限设置(频道)     role.rank > member_rank              permissions_set(channel)#L32
+```
+
+**统一的互锁模式**：所有检查都遵循"只能操作 rank 严格低于自己 ranking 的对象"这一原则，用 `role.rank <= member_rank` 或 `target_ranking <= our_ranking` 来拦截越级操作。
+
+---
+
+## 十四、关键代码索引
 
 | 职责 | 文件 |
 |---|---|
 | 权限位定义 | [channel.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/channel.rs) |
 | Override 结构 | [mod.rs (models)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs) |
 | PermissionValue 操作 | [mod.rs (models)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L14-L114) |
+| throw_permission_override | [mod.rs (models)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L92-L113) |
 | PermissionQuery trait | [trait.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/trait.rs) |
-| 权限计算核心逻辑 | [impl.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs) |
-| 数据库适配器 | [permissions.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs) |
-| 批量权限计算 | [bulk_permissions.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs) |
+| 权限计算核心逻辑（trait 版） | [impl.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs) |
+| 数据库适配器（单用户） | [permissions.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs) |
+| 批量权限计算（含同步版 calculate_server_permissions） | [bulk_permissions.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs) |
 | 角色删除路由 | [roles_delete.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_delete.rs) |
+| 角色编辑路由（rank 互锁） | [roles_edit.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_edit.rs) |
+| 角色排序路由（rank 互锁） | [roles_edit_positions.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_edit_positions.rs) |
+| 成员编辑路由（双重 rank 互锁） | [member_edit.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/member_edit.rs) |
+| 服务器角色权限设置 | [permissions_set.rs (server)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/permissions_set.rs) |
+| 频道角色权限设置 | [permissions_set.rs (channel)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/channels/permissions_set.rs) |
 | 角色删除 DB 操作 | [mongodb.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/servers/ops/mongodb.rs#L113-L156) |
 | 成员 ranking | [model.rs (members)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/server_members/model.rs#L243-L254) |
 | 语音权限同步 | [voice/mod.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/voice/mod.rs#L441-L466) |
