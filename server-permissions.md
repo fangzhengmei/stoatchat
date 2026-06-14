@@ -111,6 +111,117 @@ pub fn apply(&mut self, v: Override) {
 
 数据库存储层使用紧凑的 [OverrideField](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L52-L57)（字段名 `a` / `d`），与 `Override` 通过 `From` 互转。
 
+### 2.1 PermissionValue 的四个位操作及其分布
+
+`PermissionValue` 提供了四个核心位操作方法，分布在代码的不同位置，各自承担不同的语义角色：
+
+| 方法 | 位运算 | 语义 | 调用位置 |
+|---|---|---|---|
+| `allow(v)` | `self.0 \|= v` | 授予权限（只加不减） | 仅被 `apply` 内部调用 |
+| `revoke(v)` | `self.0 &= !v` | 收回权限（只减不加） | `apply` 内部 + 语音开关 + 单项撤销 |
+| `restrict(v)` | `self.0 &= v` | 限制到指定范围（封顶） | Timeout 处理（两次） |
+| `revoke_all()` | `self.0 = 0` | 清零全部权限 | ViewChannel 守卫 |
+
+**逐操作的精确分布**：
+
+**`allow(v)` — OR 操作，设置位**
+
+`allow` 是唯一一个**只被 `apply` 内部调用**的操作，没有独立的调用点。它的作用是"授予"权限位——任何在 `v` 中为 1 的位，结果中也一定为 1。
+
+```rust
+pub fn allow(&mut self, v: u64) {
+    self.0 |= v;  // 只能设 1，不能清 0
+}
+```
+
+- 调用位置：[mod.rs#L25](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L25) — `apply` 内部 `self.allow(v.allow)`
+- 特性：幂等（重复 allow 同一位不会改变结果）
+
+**`revoke(v)` — AND NOT 操作，清除位**
+
+`revoke` 是使用最广泛的操作，有两个独立的调用场景：
+
+```rust
+pub fn revoke(&mut self, v: u64) {
+    self.0 &= !v;  // 只能清 0，不能设 1
+}
+```
+
+| 调用位置 | 代码 | 场景 |
+|---|---|---|
+| [mod.rs#L26](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L26) | `self.revoke(v.deny)` | `apply` 内部——处理 Override 的 deny 部分 |
+| [impl.rs#L65-L66](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L65-L66) | `revoke(Speak as u64); revoke(Video as u64)` | 语音开关——can_publish=false |
+| [impl.rs#L70](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L70) | `revoke(Listen as u64)` | 语音开关——can_receive=false |
+
+- 特性：幂等（重复 revoke 同一位不会改变结果）
+- 与 `restrict` 的区别：`revoke` 只清除指定位（局部操作），`restrict` 限制到指定位（全局操作）
+
+**`restrict(v)` — AND 操作，封顶到位空间**
+
+`restrict` 是最激进的操作，它将权限值限制在 `v` 的位空间内——任何不在 `v` 中的位都会被清零。
+
+```rust
+pub fn restrict(&mut self, v: u64) {
+    self.0 &= v;  // 全局截断
+}
+```
+
+| 调用位置 | 代码 | 场景 |
+|---|---|---|
+| [impl.rs#L74](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L74) | `restrict(*ALLOW_IN_TIMEOUT)` | 服务器级 Timeout 第一次封顶 |
+| [impl.rs#L133](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L133) | `restrict(*ALLOW_IN_TIMEOUT)` | 频道级 Timeout 第二次封顶 |
+
+- 特性：幂等（重复 restrict 同一值不会改变结果）
+- **关键**：`restrict` 后 `apply` 可以恢复位（因为 `apply` 内部的 `allow` 是 OR 操作），这正是 Timeout 需要二次 restrict 的根本原因
+
+**`revoke_all()` — 赋零操作，彻底清零**
+
+```rust
+pub fn revoke_all(&mut self) {
+    self.0 = 0;
+}
+```
+
+| 调用位置 | 代码 | 场景 |
+|---|---|---|
+| [impl.rs#L137](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L137) | `revoke_all()` | ViewChannel 守卫——无 ViewChannel 则一切归零 |
+
+- 特性：不可逆（后续 `apply` 可以恢复位，但逻辑上不应出现这种情况）
+- 仅在 ServerChannel 分支使用，其他频道类型不需要
+
+**四个操作的关系图**：
+
+```
+                    ┌─────────┐
+         apply ────→│  allow   │ OR 操作：设 1
+         (内部)     └─────────┘
+                    ┌─────────┐
+         apply ────→│  revoke  │ AND NOT 操作：清 0
+         (内部)     │          │
+  语音开关 ────────→│          │ 独立调用：清除特定权限
+                    └─────────┘
+                    ┌─────────┐
+  Timeout ────────→│ restrict │ AND 操作：全局封顶
+  (两次)           └─────────┘
+                    ┌─────────┐
+  ViewChannel ────→│revoke_all│ 赋零：彻底清零
+  守卫              └─────────┘
+```
+
+**`revoke` vs `restrict` 的本质区别**：
+
+```rust
+// revoke: 只清除指定位，其他位不受影响
+permissions = 0b1111;
+permissions.revoke(0b0010);  // 结果: 0b1101 — 只清了 bit 1
+
+// restrict: 限制到位空间，不在掩码中的位全部清零
+permissions = 0b1111;
+permissions.restrict(0b0011); // 结果: 0b0011 — bit 2 和 3 被清零
+```
+
+这就是为什么 Timeout 用 `restrict` 而不是 `revoke`——它需要把权限**封顶**到只保留 ViewChannel + ReadMessageHistory，而不是逐个收回不需要的权限。
+
 ---
 
 ## 三、全局权限计算——服务器层
@@ -150,9 +261,17 @@ DEFAULT_PERMISSION_VIEW_ONLY + SendMessage + InviteOthers + SendEmbeds + UploadF
 
 ### 3.4 语音开关
 
-成员级 `can_publish` / `can_receive` 字段（默认 `true`）在服务器权限计算后额外检查：
-- `can_publish = false` → 收回 `Speak` + `Video`
-- `can_receive = false` → 收回 `Listen`
+成员级 `can_publish` / `can_receive` 字段（默认 `true`）在 `calculate_server_permissions` 内部、角色叠加之后、Timeout restrict 之前执行（[impl.rs#L64-L71](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L64-L71)）：
+- `can_publish = false` → `revoke(Speak + Video)`
+- `can_receive = false` → `revoke(Listen)`
+
+**时序含义**：语音开关使用 `revoke`（AND NOT），只能清除位。它在角色叠加之后执行，所以角色覆盖无法恢复被收回的语音权限。但如果后续频道覆盖（频道级 `apply`）的 allow 包含 Speak/Video/Listen，理论上可以恢复——不过实际场景中频道覆盖几乎不会这么做。
+
+**与 Timeout 的交互**：语音开关在 Timeout restrict 之前执行。如果成员同时被 mute 和 Timeout：
+1. 角色叠加后得到某权限值
+2. 语音开关 revoke 清除 Speak/Video/Listen
+3. Timeout restrict 封顶到 ViewChannel + ReadMessageHistory
+4. 即使没被语音开关 revoke，Timeout restrict 也会清除这些位
 
 ### 3.5 Timeout 限制
 
@@ -175,37 +294,55 @@ pub static ALLOW_IN_TIMEOUT: Lazy<u64> =
 
 [calculate_user_permissions](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L8-L46) 计算的是"我对某个用户有什么权限"，返回的是 `UserPermission` 位标志（不是 ChannelPermission）。
 
-完整决策树：
+完整决策树（逐行还原代码逻辑）：
 
 ```
 calculate_user_permissions(query)
   │
-  ├─ 我是特权用户? → 是 → 返回 u64::MAX (所有权限)
-  ├─ 我们是同一个用户? → 是 → 返回 u64::MAX
+  ├─ 我是特权用户? → 是 → return u64::MAX                    ← 早期返回
+  ├─ 我们是同一个用户? → 是 → return u64::MAX                 ← 早期返回
+  │
+  ├─ permissions = 0                                          ← 初始化
   │
   ├─ 读取用户关系 relationship
-  │   ├─ Friend (好友) → 返回 u64::MAX
-  │   ├─ Blocked / BlockedOther (互相屏蔽) → 返回 Access (仅能访问)
-  │   ├─ Incoming / Outgoing (有未处理的好友请求) → 设置为 Access
-  │   └─ None / 其他 → 保持 0
+  │   ├─ Friend → return u64::MAX                             ← 早期返回，不走后续逻辑
+  │   ├─ Blocked / BlockedOther → return Access               ← 早期返回，不走后续逻辑
+  │   ├─ Incoming / Outgoing → permissions = Access            ← ⚠️ 不返回！穿透到下一段
+  │   └─ None / 其他 → permissions 保持 0                      ← ⚠️ 也不返回！穿透到下一段
   │
   └─ 是否有共同连接 (共同服务器)?
-      ├─ 否 → 返回当前 permissions
-      └─ 是 → permissions = Access + ViewProfile
-             ├─ 对方是 bot 或 我是 bot → 额外加 SendMessage
-             └─ 返回 permissions
+      ├─ 否 → return permissions                              ← 返回 Access 或 0
+      └─ 是 → permissions = Access + ViewProfile               ← ⚠️ 覆盖而非追加！
+             ├─ 对方是 bot 或 我是 bot → permissions += SendMessage
+             └─ return permissions
 ```
 
-**关系状态与权限映射表**：
+> **⚠️ 纠正**：旧版文档的决策树暗示每种关系状态独立对应一个结果，但代码中 `Incoming`/`Outgoing` 和 `None` 并不早期返回——它们**穿透**到下一段"共同连接"逻辑。这意味着 `Incoming`/`Outgoing` 状态下如果有共同服务器，权限会被**覆盖**为 `Access + ViewProfile`（而不是在 Access 之上追加 ViewProfile）。
 
-| RelationshipStatus | UserPermission | 说明 |
-|---|---|---|
-| `Friend` | `u64::MAX` (全部) | 好友完全信任 |
-| `Blocked` / `BlockedOther` | `Access` | 屏蔽状态仅可访问 |
-| `Incoming` / `Outgoing` | `Access` | 有好友请求待处理 |
-| `None` + 无共同服务器 | `0` | 完全无权限 |
-| `None` + 有共同服务器 | `Access + ViewProfile` | 可访问 + 可查看资料 |
-| 有共同服务器 + 一方是 bot | 追加 `SendMessage` | bot 可自动互发消息 |
+**穿透逻辑的精确行为**：
+
+```
+Incoming/Outgoing + 无共同服务器 → Access（来自 match 分支的赋值）
+Incoming/Outgoing + 有共同服务器 → Access + ViewProfile（被覆盖！不是 Access + Access + ViewProfile）
+None + 无共同服务器 → 0
+None + 有共同服务器 → Access + ViewProfile
+None + 有共同服务器 + bot → Access + ViewProfile + SendMessage
+```
+
+关键细节：`have_mutual_connection` 分支用 `permissions = Access + ViewProfile` 做了**赋值覆盖**（`=`），不是追加（`+=`）。所以无论进入时 `permissions` 是 0 还是 Access，结果都相同。
+
+**关系状态与权限映射表（最终结果）**：
+
+| RelationshipStatus | 共同服务器 | 最终 UserPermission | 说明 |
+|---|---|---|---|
+| `Friend` | 不重要 | `u64::MAX` (全部) | 好友完全信任，早期返回 |
+| `Blocked` / `BlockedOther` | 不重要 | `Access` | 屏蔽状态仅可访问，早期返回 |
+| `Incoming` / `Outgoing` | 无 | `Access` | 有好友请求，无进一步关系 |
+| `Incoming` / `Outgoing` | 有 | `Access + ViewProfile` | 被共同连接覆盖 |
+| `Incoming` / `Outgoing` | 有 + bot | `Access + ViewProfile + SendMessage` | bot 追加发消息 |
+| `None` | 无 | `0` | 完全无权限 |
+| `None` | 有 | `Access + ViewProfile` | 共同服务器成员 |
+| `None` | 有 + bot | `Access + ViewProfile + SendMessage` | bot 追加发消息 |
 
 **注意**：这一链路计算的是 `UserPermission`（用户间权限，占低 4 位），不是 `ChannelPermission`（频道权限，占高位）。两者通过桥接转换。
 
@@ -254,7 +391,7 @@ ChannelType::DirectMessage => {
 ```
 
 **桥接三步曲**：
-1. `set_recipient_as_user()`：将查询对象切换为 DM 的另一个参与者
+1. `set_recipient_as_user()`：将查询对象切换为 DM 的另一个参与者（详见下文副作用分析）
 2. `calculate_user_permissions()`：计算"我对他有什么 UserPermission"
 3. **判断 + 映射**：如果有 `UserPermission::SendMessage`（bit 2），则映射为完整的 DM 频道权限；否则映射为仅查看权限
 
@@ -264,6 +401,47 @@ ChannelType::DirectMessage => {
   - 其中 `DEFAULT_PERMISSION` = `VIEW_ONLY + SendMessage + InviteOthers + SendEmbeds + UploadFiles + Connect + Speak + Listen + Video + React + ChangeNickname + ChangeAvatar`
 
 也就是说，**用户间的 `SendMessage` 权限直接决定了在 DM 频道中几乎所有交互权限**。这是一个全有或全无的映射。
+
+### 4.4 set_recipient_as_user 的副作用分析
+
+[set_recipient_as_user](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs#L324-L341) 是整个权限系统中**唯一一个会修改查询上下文状态**的 trait 方法。它不是纯查询，而是一个有副作用的操作。
+
+**执行内容**：
+
+```rust
+async fn set_recipient_as_user(&mut self) {
+    // 1. 从 DM 频道的 recipients 中找到"不是我"的那个用户 ID
+    let recipient_id = recipients.iter()
+        .find(|recipient| recipient != &&self.perspective.id)
+        .expect("Missing recipient for DM");
+
+    // 2. 从数据库拉取该用户的完整数据
+    if let Ok(user) = self.database.fetch_user(recipient_id).await {
+        // 3. 替换 self.user 字段
+        self.user.replace(Cow::Owned(user));
+    }
+}
+```
+
+**副作用链**——替换 `self.user` 后，所有后续 trait 方法的返回值都会基于**新用户**计算：
+
+| 受影响的 trait 方法 | 变化 |
+|---|---|
+| `are_the_users_same()` | `perspective.id == new_user.id`（可能从 false 变为 true，但 DM 场景下不可能） |
+| `user_relationship()` | 基于 `new_user.id` 在 `perspective.relations` 中查找关系 |
+| `user_is_bot()` | 返回 `new_user.bot.is_some()` |
+| `have_mutual_connection()` | 基于 `new_user.id` 查找共同服务器 |
+
+**时序至关重要**：`set_recipient_as_user` 必须在 `calculate_user_permissions` **之前**调用。代码中正是如此（[impl.rs#L96-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L96-L98)）：
+
+```rust
+query.set_recipient_as_user().await;           // 先替换 user
+let permissions = calculate_user_permissions(query).await;  // 再基于新 user 计算
+```
+
+**对比 set_server_from_channel**：[set_server_from_channel](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs#L345-L375) 有类似的副作用模式——从频道中提取 server ID 并加载服务器数据到 `self.server`。但它有一个**缓存优化**：如果 `self.server` 已存在且 ID 匹配，则跳过数据库查询。`set_recipient_as_user` 没有这个缓存优化——每次调用都会触发数据库查询。
+
+**设计意图**：这两个方法之所以存在，是因为 `DatabasePermissionQuery` 的 Builder 模式允许只传入部分数据（如只传 channel 不传 server/user），缺失的数据在计算时按需加载。这是一种 lazy loading 策略，避免了在构建查询时就必须加载所有关联实体。
 
 ---
 
@@ -481,17 +659,39 @@ ChannelType::Unknown => 0_u64.into(),
 
 ### 6.4 完整优先级链（从低到高）
 
+> **⚠️ 纠正**：旧版文档将"语音开关 / Timeout"统归为"后处理"放在最后，这是不准确的。语音开关和 Timeout 在代码中分属不同层级，各有独立时序。以下为精确还原 `calculate_server_permissions` + `calculate_channel_permissions` 两条函数组合后的完整时序：
+
 ```
-server.default_permissions         ← 最底层：所有人都有
+═══════════════════════ 服务器级（calculate_server_permissions 内部）═══════════════════════
+
+server.default_permissions               ← 最底层：所有人都有
   ↓ apply
-角色 Override (高 rank → 低 rank)  ← 服务器级角色叠加
+角色 Override (高 rank → 低 rank)        ← 服务器级角色叠加
+  ↓
+语音开关 (can_publish / can_receive)      ← ⚠️ 在角色之后、Timeout 之前！
+  │ can_publish=false → revoke(Speak+Video)
+  │ can_receive=false → revoke(Listen)
+  ↓
+Timeout 第一次 restrict(ALLOW_IN_TIMEOUT) ← 服务器级 Timeout 封顶
+  ↓
+
+═══════════════════════ 频道级（calculate_channel_permissions ServerChannel 分支）═══════════════════════
+
   ↓ apply
-channel.default_permissions        ← 频道默认覆盖
+channel.default_permissions              ← 频道默认覆盖（可以恢复被 restrict 的位！）
   ↓ apply
-频道角色 Override (高 rank → 低 rank) ← 频道级角色叠加
-  ↓ 后处理
-Timeout / 语音开关 / ViewChannel 检查
+频道角色 Override (高 rank → 低 rank)    ← 频道级角色叠加（也可以恢复！）
+  ↓
+Timeout 第二次 restrict(ALLOW_IN_TIMEOUT) ← 频道级 Timeout 封顶（必需，防覆盖绕过）
+  ↓
+ViewChannel 检查                          ← 无 ViewChannel 则 revoke_all()
 ```
+
+**关键修正点**：
+1. 语音开关在服务器级**角色叠加之后、Timeout restrict 之前**执行，不是最后
+2. Timeout 被执行两次，分别位于服务器级末尾和频道级末尾
+3. 语音开关使用 `revoke`（AND NOT），只能清除权限，不会恢复被 restrict 的位
+4. 语音开关在服务器级执行后，频道覆盖无法恢复被收回的语音权限（因为 `apply` 的 OR allow 可以恢复，但实际场景中频道覆盖通常不会 allow 语音权限给被 mute 的成员）
 
 **核心原则**：后执行的 `apply` 覆盖先执行的结果。同一层内，低 rank（高优先级）角色的 allow 可以恢复被高 rank 角色 deny 掉的权限，反之亦然。
 
