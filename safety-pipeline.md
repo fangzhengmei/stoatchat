@@ -12,6 +12,10 @@
 8. **`safety/report` 路由有限流保护**——限流桶名 `safety_report`，阈值 3 次/周期。另有通用 `safety` 桶 15 次/周期。
 9. **`reported` 字段被写入但从未被读取使用**——`mark_attachment_as_reported` 将 `reported: true` 写入附件，但全代码库没有任何下游分支根据 `reported` 字段做逻辑判断。该字段是死字段。
 10. **`generate_from_message` 抓取上下文时没有读权限校验**——用户可以举报任意频道的任意消息（只要知道 message_id），快照会抓取该频道前后各 15 条消息，无论举报人是否有权限访问该频道。这是一个越权读取漏洞。
+11. **`safety/report` 路由没有绑定 IdempotencyKey**——客户端重复提交会产生重复举报记录。对比消息发送和 Webhook 执行都有幂等键保护。
+12. **Bot 账号发起举报被禁止，但 Bot 可以被举报**——举报者是 bot 会返回 `IsBot` 错误；但 User 类型举报和 Message 类型举报都不检查被举报对象是否是 bot，bot 账号和 bot 发送的消息都可以正常被举报。
+13. **`EventV1::ReportCreate` 载荷包含完整 Report 数据**——`author_id`、`notes`、`additional_context` 等字段全部原样塞进 Redis payload。虽然 `"global"` 通道当前无订阅者，但如果未来新增订阅者，敏感字段会被广播出去。
+14. **限流桶计数维度是 session.id（优先）+ IP（兜底）**——Delta 服务的 Rocket 限流器优先使用会话 ID 作为标识符，同一用户的不同设备/浏览器有独立的限流桶；未登录用户按 IP 限流。不是按 user.id 限流。
 
 ---
 
@@ -1046,6 +1050,360 @@ ReportedContent::Server { id, .. } => {
 
 ---
 
+## 十五、safety/report 路由的 IdempotencyKey 缺失分析
+
+### 15.1 现状：举报路由没有幂等键保护
+
+[safety/report 路由](file:///d:/fz/0601-1\solo-dogfeeding\code\90-backend\crates\delta\src\routes\safety\report_content.rs#L27-L31) 的函数签名：
+
+```rust
+pub async fn report_content(
+    db: &State<Database>,
+    user: User,
+    data: Json<DataReportContent>,
+) -> Result<EmptyResponse> {
+```
+
+**没有 `IdempotencyKey` 参数。**
+
+### 15.2 对比：有幂等键保护的路由
+
+作为对比，消息发送和 Webhook 执行都有幂等键：
+
+| 路由 | 是否有 IdempotencyKey | 代码位置 |
+|------|----------------------|---------|
+| `POST /channels/{id}/messages` | ✅ 有 | [message_send.rs:L30](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/channels/message_send.rs#L30) |
+| `POST /webhooks/{id}/{token}` | ✅ 有 | [webhook_execute.rs:L24](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/webhooks/webhook_execute.rs#L24) |
+| `POST /safety/report` | ❌ 无 | [report_content.rs:L27-L31](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/safety/report_content.rs#L27-L31) |
+
+### 15.3 IdempotencyKey 的工作原理
+
+`IdempotencyKey` 从请求头 `X-Idempotency` 中提取：
+
+- 如果请求带有幂等键，服务器会检查该键是否已被使用过
+- 如果已使用过，直接返回之前的结果，不重复执行业务逻辑
+- 如果未使用过，执行业务逻辑并缓存结果
+
+这样可以防止客户端因网络重试、用户双击等原因导致的重复提交。
+
+### 15.4 缺失幂等键的影响
+
+由于举报路由没有幂等键保护，**客户端重复提交会产生重复的举报记录**：
+
+| 场景 | 结果 |
+|------|------|
+| 用户误双击提交按钮 | 产生 2 条内容完全相同的举报 |
+| 网络重试（客户端超时重发） | 产生多条重复举报 |
+| 脚本恶意刷举报 | 受限流限制（3 次/周期），但每个周期内都可以提交多条 |
+
+### 15.5 为什么举报路由没有幂等键？
+
+可能的设计原因：
+
+1. **优先级低**：举报不是核心功能，重复提交的危害不大（最多增加审核工作量）
+2. **限流兜底**：3 次/周期的限流已经限制了重复提交的频率
+3. **遗漏**：开发时忘记添加，属于功能缺失
+4. **返回 EmptyResponse**：举报返回 204 无内容，没有需要缓存的响应体，实现幂等键的价值较低
+
+### 15.6 与限流的关系
+
+幂等键和限流是两个不同层面的保护：
+
+| 维度 | 限流 | 幂等键 |
+|------|------|--------|
+| 作用 | 限制频率 | 防止重复 |
+| 粒度 | 时间窗口 | 请求级 |
+| 相同内容多次提交 | 消耗额度但允许 | 直接返回缓存结果 |
+| 不同内容提交 | 都消耗额度 | 都正常执行 |
+
+当前举报路由只有限流，没有幂等键。
+
+---
+
+## 十六、Bot 账号的举报过滤逻辑
+
+### 16.1 举报者侧：Bot 不能发起举报
+
+[report_content.rs:L39-L42](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/safety/report_content.rs#L39-L42)：
+
+```rust
+// Bots cannot create reports
+if user.bot.is_some() {
+    return Err(create_error!(IsBot));
+}
+```
+
+**举报者如果是 Bot 账号，直接返回 `IsBot` 错误。**
+
+这与其他社交功能的设计一致：
+
+| 功能 | Bot 是否被禁止 | 代码位置 |
+|------|---------------|---------|
+| 发起举报 | ✅ 禁止 | [report_content.rs:L40](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/safety/report_content.rs#L40) |
+| 加好友 | ✅ 禁止 | [add_friend.rs:L21](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/users/add_friend.rs#L21) |
+| 发好友请求 | ✅ 禁止 | [send_friend_request.rs:L22](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/users/send_friend_request.rs#L22) |
+| 创建服务器 | ✅ 禁止 | [server_create.rs:L21](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/servers/server_create.rs#L21) |
+| 服务器确认 | ✅ 禁止 | [server_ack.rs:L21](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/servers/server_ack.rs#L21) |
+
+设计意图：Bot 是程序控制的账号，不应该主动发起社交互动（包括举报）。
+
+### 16.2 被举报者侧：Bot 可以被举报
+
+**User 类型举报**（举报用户账号）：
+
+[report_content.rs:L69-L75](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/safety/report_content.rs#L69-L75)：
+
+```rust
+ReportedContent::User { id, message_id, .. } => {
+    let reported_user = db.fetch_user(id).await?;
+
+    // Users cannot report themselves
+    if reported_user.id == user.id {
+        return Err(create_error!(CannotReportYourself));
+    }
+    // ... 没有检查 reported_user.bot
+}
+```
+
+**只检查了不能举报自己，没有检查被举报用户是不是 Bot。**
+
+**Message 类型举报**（举报消息）：
+
+消息的 `author` 字段可能指向 Bot 账号，但代码中只检查了 `message.author == user.id`（不能举报自己），没有检查消息作者是不是 Bot。
+
+### 16.3 设计意图分析
+
+为什么举报者要过滤 Bot，但被举报者不过滤？
+
+```
+设计意图：
+
+  举报者（主动方）        被举报者（被动方）
+  ┌───────────────┐      ┌───────────────┐
+  │ Bot 被禁止    │      │ Bot 可以被举报│
+  │ (主动社交行为) │      │ (接受审核)     │
+  └───────────────┘      └───────────────┘
+```
+
+合理的设计逻辑：
+
+1. **Bot 不应该主动举报**：举报是人的行为，Bot 作为程序不应主动发起举报
+2. **Bot 可以被举报**：Bot 发送垃圾消息、恶意内容等，用户应该能举报 Bot
+3. **一致性**：Bot 发送的消息可以被举报，Bot 账号本身也可以被举报
+
+### 16.4 潜在问题
+
+虽然设计上 Bot 可以被举报是合理的，但有一个潜在问题：
+
+**Bot 账号通常由开发者管理，对 Bot 的举报应该如何处理？**
+
+- 是处罚 Bot 账号本身（封禁、限制）？
+- 还是处罚 Bot 的所有者？
+- 处罚是否会传播到所有者的其他 Bot？
+
+这些问题在当前代码中没有答案，因为管理后台和 strike 处罚体系都尚未实现。
+
+---
+
+## 十七、EventV1::ReportCreate 载荷的敏感字段分析
+
+### 17.1 ReportCreate 事件包含完整 Report 对象
+
+[EventV1 枚举定义](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/events/client.rs#L268)：
+
+```rust
+/// New report
+ReportCreate(Report),
+```
+
+`ReportCreate` 变体直接包含 `Report` 结构体，没有做任何字段裁剪或脱敏。
+
+### 17.2 Report 结构体的完整字段
+
+[Report 模型](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/models/src/v0/safety_reports.rs#L5-L21)：
+
+```rust
+pub struct Report {
+    pub id: String,                  // 报告 ID
+    pub author_id: String,           // 举报人 ID ⚠️
+    pub content: ReportedContent,    // 被举报内容
+    pub additional_context: String,  // 举报描述 ⚠️
+    #[serde(flatten)]
+    pub status: ReportStatus,        // 状态
+    #[serde(default)]
+    pub notes: String,               // 管理员备注 ⚠️
+}
+```
+
+### 17.3 发布前的转换
+
+[report_content.rs:L131](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/safety/report_content.rs#L131)：
+
+```rust
+EventV1::ReportCreate(report.into()).global().await;
+```
+
+`report.into()` 调用 `From<crate::Report> for Report` 实现，将数据库模型转换为 API 模型。
+
+[bridge/v0.rs:L606-L617](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/util/bridge/v0.rs#L606-L617)：
+
+```rust
+impl From<crate::Report> for Report {
+    fn from(value: crate::Report) -> Self {
+        Report {
+            id: value.id,
+            author_id: value.author_id,       // 原样拷贝
+            content: value.content,           // 原样拷贝
+            additional_context: value.additional_context, // 原样拷贝
+            status: value.status,             // 原样拷贝
+            notes: value.notes,               // 原样拷贝
+        }
+    }
+}
+```
+
+**所有字段全部原样拷贝，没有任何脱敏或裁剪。**
+
+### 17.4 敏感字段清单
+
+| 字段 | 敏感性 | 说明 |
+|------|--------|------|
+| `author_id` | 中 | 暴露举报人身份。如果事件被广播给普通用户，大家都知道是谁举报的 |
+| `additional_context` | 中高 | 举报描述文本，可能包含举报人提供的敏感信息 |
+| `notes` | 高 | 管理员备注，可能包含内部审核意见。但当前创建时 `notes` 是空字符串 |
+| `content`（含消息快照引用） | 中 | 被举报内容的 ID 和类型，本身不敏感，但可能间接泄露信息 |
+
+### 17.5 当前风险评估
+
+由于 `"global"` 通道**目前没有任何订阅者**，所以这些敏感字段实际上不会泄露给任何人。
+
+```
+风险现状：
+
+  Redis "global" 通道
+    │
+    ├─ 发布者: delta (ReportCreate 事件)
+    │
+    └─ 订阅者: 空（无任何客户端订阅）
+        ↓
+        当前风险：低（事件发布后立即被丢弃）
+```
+
+但这是一个**潜在风险**：
+
+1. 如果未来有人为 `"global"` 通道添加订阅者，敏感字段会立即暴露
+2. 如果事件被错误地发布到其他通道（如 `server(id)` 或 `private(id)`），也会造成泄露
+3. 如果 Redis 本身不安全（如未设置密码），攻击者可以直接监听所有 PUBLISH 消息
+
+### 17.6 设计意图与改进方向
+
+**当前设计**：ReportCreate 事件包含完整 Report 数据，推送到 `"global"` 通道。
+
+**推测的设计意图**：管理后台服务应该订阅 `"global"` 通道（或专用的管理员通道），管理员上线后实时接收新举报通知，包含完整信息以便快速审核。
+
+**改进建议**：
+
+| 改进方向 | 具体措施 |
+|---------|---------|
+| 通道隔离 | 不要推送到 `"global"`，推送到专用的管理员通道（如 `"admin_reports"`） |
+| 字段裁剪 | 面向普通用户的事件不应包含 `author_id`、`notes` 等敏感字段 |
+| 分级推送 | 给管理员推完整信息，给普通用户推最小信息（或不推） |
+| 权限校验 | bonfire 收到事件后，应校验接收者是否有查看报告的权限 |
+
+---
+
+## 十八、限流桶的计数维度分析
+
+### 18.1 Delta 服务使用 Rocket 限流实现
+
+`report_content.rs` 是 Delta 服务的 Rocket 路由，所以使用的是 `revolt_ratelimits::rocket` 模块的限流实现，而不是 axum 版本。
+
+### 18.2 限流标识符的选择逻辑
+
+[rocket.rs:L60-L65](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/ratelimits/src/rocket.rs#L60-L65)：
+
+```rust
+let identifier = if let Outcome::Success(session) = request.guard::<Session>().await
+{
+    session.id  // 有会话 → 用 session.id
+} else {
+    to_real_ip(request).await  // 无会话 → 用 IP
+};
+```
+
+**计数维度：优先使用 session.id，兜底使用 IP。**
+
+### 18.3 session.id vs user.id
+
+重要区别：
+
+| 维度 | session.id | user.id |
+|------|-----------|---------|
+| 含义 | 会话 ID（每次登录一个） | 用户 ID（一个用户只有一个） |
+| 数量 | 一个用户可能有多个 session | 一个用户只有一个 user_id |
+| 限流粒度 | 每个设备/浏览器独立限流 | 全账号统一限流 |
+| 多设备影响 | 各设备互不影响 | 一台设备耗光，所有设备都受限 |
+
+**Delta 服务选择的是 session.id，不是 user.id。**
+
+### 18.4 实际限流效果
+
+对于 `safety_report` 桶（阈值 3 次/周期）：
+
+| 场景 | 实际限流效果 |
+|------|-------------|
+| 用户在浏览器 A 举报 | 消耗 session_A 的额度，3 次后 A 受限 |
+| 用户切换到浏览器 B 举报 | 消耗 session_B 的额度，独立计算，B 还可以举报 3 次 |
+| 用户同时用手机 App 举报 | 消耗 session_C 的额度，又可以举报 3 次 |
+| 未登录用户举报 | 消耗 IP 的额度 |
+| 同一 IP 下多个未登录用户 | 共享同一 IP 的限流桶 |
+
+### 18.5 与 axum 版本的对比
+
+作为对比，axum 版本的限流使用 user.id：
+
+[axum.rs:L63-L67](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/ratelimits/src/axum.rs#L63-L67)：
+
+```rust
+let identifier = if let Ok(user) = parts.extract_with_state::<User, _>(state).await {
+    user.id  // axum 版本用 user.id
+} else {
+    to_real_ip(parts).await
+};
+```
+
+| 版本 | 登录用户标识符 | 未登录用户标识符 |
+|------|--------------|----------------|
+| Rocket (Delta) | `session.id` | IP |
+| Axum | `user.id` | IP |
+
+**为什么会有这个差异？** 可能是不同团队开发，或者 Rocket 版本更老，后续 axum 版本做了优化。
+
+### 18.6 对举报限流的影响
+
+使用 session.id 作为限流维度，对于举报功能的影响：
+
+| 方面 | 影响 |
+|------|------|
+| 正常用户 | 体验更好，多设备不会互相影响 |
+| 恶意用户 | 可以通过创建多个 session（多开浏览器、多设备）绕过限流 |
+| 实际防护效果 | 比 user.id 弱，但比纯 IP 强 |
+| 配合 Bot 禁止 | Bot 不能发起举报，所以恶意脚本无法用 Bot 账号绕限流 |
+
+### 18.7 限流周期
+
+从 [ratelimiter.rs:L54](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/ratelimits/src/ratelimiter.rs#L54) 可以看出：
+
+```rust
+reset: now().add(Duration::from_secs(10)).as_millis(),
+```
+
+**限流窗口是 10 秒**。
+
+所以 `safety_report` 桶的实际限流是：**每个 session 每 10 秒最多 3 次举报**。
+
+---
+
 ## 六、附录：代码引用索引
 
 | 组件 | 文件 | 关键行 |
@@ -1082,3 +1440,12 @@ ReportedContent::Server { id, .. } => {
 | generate_from_message | [safety_snapshots/model.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/safety_snapshots/model.rs) | L42-L93 |
 | safety_strikes 集合创建 | [init.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/admin_migrations/ops/mongodb/init.rs) | L79-L81 |
 | safety_strikes 迁移脚本 | [scripts.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/admin_migrations/ops/mongodb/scripts.rs) | L688-L708 |
+| IdempotencyKey 导入 | [message_send.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/channels/message_send.rs) | L7, L30 |
+| Webhook 幂等键 | [webhook_execute.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/webhooks/webhook_execute.rs) | L3, L24 |
+| Bot 禁止举报判断 | [report_content.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/safety/report_content.rs) | L39-L42 |
+| Bot 禁止加好友 | [add_friend.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/users/add_friend.rs) | L21 |
+| Report 桥接转换 | [bridge/v0.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/util/bridge/v0.rs) | L606-L617 |
+| Rocket 限流实现 | [rocket.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/ratelimits/src/rocket.rs) | L60-L65 |
+| Axum 限流实现 | [axum.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/ratelimits/src/axum.rs) | L63-L67 |
+| 限流窗口周期 | [ratelimiter.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/ratelimits/src/ratelimiter.rs) | L54 |
+| Report v0 模型 | [v0/safety_reports.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/models/src/v0/safety_reports.rs) | L5-L21 |
