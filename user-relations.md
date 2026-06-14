@@ -1568,3 +1568,354 @@ if perspective.id == self.id {
 - 机器人看自己（理论上不会发生）→ None
 
 这符合社交平台上机器人的设计：机器人是公开可见的服务实体，没有好友关系的概念。`user_relationship()` 中 `bot.owner` 返回 `User` 的分支，在序列化场景下永远不会暴露给客户端。
+
+---
+
+## 16. 关系变更事件推送到客户端的完整链路
+
+### 16.1 事件构造时选择的序列化路径
+
+`apply_relationship` 中构造关系变更事件时，**调用的是 `into()`（常规权限路径）**，不是 `into_known()`：
+
+位置：[model.rs#L505-L517](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/models/users/model.rs#L505-L517)
+
+```rust
+// 向 target 推送：target 看到 self 的关系变化
+EventV1::UserRelationship {
+    id: target.id.clone(),
+    user: self.clone().into(db, Some(&*target)).await,   // ← 调用 into()，传 target 作为 perspective
+}
+.private(target.id.clone())
+.await;
+
+// 向 self 推送：self 看到 target 的关系变化
+EventV1::UserRelationship {
+    id: self.id.clone(),
+    user: target.clone().into(db, Some(&*self)).await,   // ← 调用 into()，传 self 作为 perspective
+}
+.private(self.id.clone())
+.await;
+```
+
+**注意 perspective 的交换**：
+- 给 target 发的事件里，user 对象是"self 从 target 视角"序列化 → `self.clone().into(db, Some(target))`
+- 给 self 发的事件里，user 对象是"target 从 self 视角"序列化 → `target.clone().into(db, Some(self))`
+
+这确保每个用户收到的事件中，对方的 `relationship` 字段和 `can_see_profile`（进而决定 online/status 字段）都是**从接收者自己的视角**算出来的。
+
+### 16.2 为什么事件用 `into()` 不用 `into_known()`？
+
+`into_known()` 的注释是 "assuming mutual connection"——假设已经有共同连接。但关系变更事件的触发场景是**任意**的：
+- 可能两个陌生人刚发了好友请求（还没共同连接）
+- 可能刚解除好友（不再有共同连接）
+
+所以不能用假设性的 `into_known()`，必须用完整的 `into()` 精确计算每一次的关系状态和资料可见性。即使有共同连接，`into()` 的结果也不会比 `into_known()` 差（最多只是计算成本更高）。
+
+### 16.3 事件到达客户端后的缓存更新
+
+bonfire 网关收到 `UserRelationship` 事件后：
+
+位置：[bonfire/impl.rs#L654-L661](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/bonfire/src/events/impl.rs#L654-L661)
+
+```rust
+EventV1::UserRelationship { id, user, .. } => {
+    self.cache.users.insert(id.clone(), user.clone().into());
+    // ↑ 直接覆盖缓存中的该用户对象
+
+    if self.cache.can_subscribe_to_user(id) {
+        self.insert_subscription(id.clone()).await;
+    } else {
+        self.remove_subscription(id).await;
+    }
+}
+```
+
+然后再通过 WebSocket 把整个事件广播给客户端。客户端收到后同样更新本地缓存，界面自动刷新。
+
+---
+
+## 17. 相同屏蔽关系在两条路径下得到反向可见性的代码分析
+
+### 17.1 先建立场景
+
+**A 屏蔽了 B**，所以：
+- A.relations = `[{ B, Blocked }]`        ← A 知道自己屏蔽了 B
+- B.relations = `[{ A, BlockedOther }]`   ← B 知道自己被 A 屏蔽了
+
+现在看 **B 查 A**（被屏蔽者查屏蔽者）的两种场景。
+
+### 17.2 场景一：B 通过用户详情页查 A → 走 `into()` 常规路径
+
+B 调用 `GET /users/<A_id>`，API 层调 `a_user.into(db, Some(&b_user))`。
+
+`into()` 内部的计算：
+
+位置：[bridge/v0.rs#L1000-L1024](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/bridge/v0.rs#L1000-L1024)
+
+```rust
+// perspective = B，self = A
+if self.bot.is_some() { ... }           // A 不是机器人 → 跳过
+else if let Some(perspective) = perspective {
+    let mut query = DatabasePermissionQuery::new(db, perspective).user(&self);
+
+    if perspective.id == self.id { ... } // B.id ≠ A.id → 跳过
+    else {
+        // ① relationship：从 B.relations 中找 A
+        let relationship = perspective.relations.as_ref().map(|relations| {
+            relations.iter()
+                .find(|r| r.id == self.id)   // 找到 BlockedOther
+                .map(|r| r.status.clone().into())
+                .unwrap_or_default()
+        }).unwrap_or_default();
+        // relationship = BlockedOther ✓
+
+        // ② can_see_profile：调用完整权限引擎
+        let can_see = calculate_user_permissions(&mut query)
+            .await
+            .has_user_permission(UserPermission::ViewProfile);
+    }
+}
+```
+
+**进入 `calculate_user_permissions`**：[permissions/impl.rs#L8-L22](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/permissions/src/impl.rs#L8-L22)
+
+```rust
+// perspective = B, other_user = A
+are_we_privileged() → false
+are_the_users_same() → false（B.id ≠ A.id）
+
+match query.user_relationship().await {
+    // B 看到 A 的关系是 BlockedOther → 命中
+    RelationshipStatus::Blocked | RelationshipStatus::BlockedOther => {
+        return (UserPermission::Access as u64).into()  // 只给 Access
+    }
+    ...
+}
+```
+
+所以：
+```
+can_see_profile = has_permission(ViewProfile)
+                = (Access & ViewProfile) != 0
+                = false
+```
+
+**场景一结果**：
+- `relationship = BlockedOther` ✓
+- `can_see_profile = false` → A 的在线状态隐藏，状态文本隐藏
+
+### 17.3 场景二：A 和 B 在同一个群，B 看群成员列表看到 A → 走 `into_known()` 已知用户路径
+
+调用 `a_user.into_known(Some(&b_user), is_online)`。
+
+`into_known()` 内部的计算：
+
+位置：[bridge/v0.rs#L1080-L1100](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/bridge/v0.rs#L1080-L1100)
+
+```rust
+// perspective = B，self = A
+if self.bot.is_some() { ... }           // A 不是机器人 → 跳过
+else if let Some(perspective) = perspective {
+    if perspective.id == self.id { ... } // B.id ≠ A.id → 跳过
+    else {
+        // ① relationship：和 into() 完全相同的读取逻辑
+        let relationship = perspective.relations     // 从 B.relations 找 A
+            .as_ref()
+            .map(|relations| {
+                relations.iter()
+                    .find(|r| r.id == self.id)   // 找到 BlockedOther
+                    .map(|r| r.status.clone().into())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        // relationship = BlockedOther ✓
+
+        // ② can_see_profile：⚠️ 和 into() 完全不同的逻辑！
+        let can_see_profile = relationship != RelationshipStatus::BlockedOther;
+        //                        BlockedOther != BlockedOther
+        //                      = false
+    }
+}
+```
+
+**场景二结果**：
+- `relationship = BlockedOther` ✓
+- `can_see_profile = false` → A 的在线状态隐藏，状态文本隐藏
+
+等等，**结果相同**？那用户说的"反向的资料可见性结果"是什么意思呢？
+
+### 17.4 反转视角：A 查 B（屏蔽者查被屏蔽者）
+
+这才是两条路径产生**反向结果**的场景。
+
+**A.relations = [{ B, Blocked }]，B.relations = [{ A, BlockedOther }]**
+
+现在看 **A 查 B**：
+
+---
+
+**场景一：A 通过用户详情页查 B → `into()` 常规路径**
+
+`b_user.into(db, Some(&a_user))`
+
+```
+① relationship：从 A.relations 找 B → Blocked
+② calculate_user_permissions()：
+   match Blocked → 命中 Blocked 分支 → 仅 Access
+   can_see = (Access & ViewProfile) != 0 → **false**
+```
+
+结果：A 看不到 B 的在线状态和资料。✓ 合理，因为 A 屏蔽了 B，不想看 B 的信息。
+
+---
+
+**场景二：A 和 B 在同一个群，A 看群成员列表看到 B → `into_known()` 已知用户路径**
+
+`b_user.into_known(Some(&a_user), is_online)`
+
+```
+① relationship：从 A.relations 找 B → Blocked
+② can_see_profile = relationship != BlockedOther
+                     Blocked != BlockedOther
+                   = **true**  ← ⚠️ 这里！
+```
+
+结果：**A 能看到 B 的在线状态和资料**！
+
+---
+
+### 17.5 反向结果的总结表
+
+| 场景 | 谁查谁 | 查看到的关系 | 常规路径 `into()` can_see | 已知路径 `into_known()` can_see | 结果 |
+|------|--------|-------------|-------------------------|------------------------------|------|
+| A 屏蔽 B | B 查 A | BlockedOther | **false** | **false** | 一致 |
+| A 屏蔽 B | A 查 B | Blocked | **false** | **true** | ⚠️ 反向！ |
+
+**反向的原因**：`into_known()` 的判断条件是 `relationship != BlockedOther`（我有没有被对方拉黑），而不是 `relationship != Blocked`（我有没有拉黑对方）。
+
+- 当关系是 `Blocked`（我拉黑了对方）：
+  - 常规路径：权限引擎 `match Blocked → 仅 Access` → `can_see = false`
+  - 已知路径：`Blocked != BlockedOther` → `can_see = true`
+  - 结果完全相反！
+
+**设计意图的推断**：`into_known()` 注释是"assuming mutual connection"（假设已有共同连接）。在同一个群里，你即使屏蔽了某个人，**群成员列表中仍然需要显示对方的在线状态**，因为这是公共空间的必要信息。而通过用户详情页查对方时（`into()` 路径），因为你屏蔽了对方，所以隐藏对方的状态和资料。
+
+这是一个刻意的设计差异，不是 bug：**屏蔽影响的是"点对点的可见性"，不影响"公共空间的存在性"**。
+
+---
+
+## 18. 初始连接事件的混合序列化策略与客户端反查机制
+
+### 18.1 Ready 事件的用户序列化：混合策略
+
+位置：[bonfire/impl.rs#L277-L285](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/bonfire/src/events/impl.rs#L277-L285)
+
+```rust
+// ① 其他所有用户：走 into_known（已知用户路径）
+let mut users: Vec<v0::User> = join_all(users.into_iter().map(|other_user| async {
+    let is_online = online_ids.contains(&other_user.id);
+    other_user.into_known(&user, is_online).await  // ← 已知用户路径
+})).await;
+
+// ② 自己：单独追加 into_self（自身路径）
+users.push(user.into_self(true).await);              // ← 自身路径（force_online=true）
+```
+
+**为什么用混合策略？**
+
+| 用户类型 | 序列化方法 | 原因 |
+|---------|-----------|------|
+| 其他用户 | `into_known(perspective, is_online)` | Ready 时能列出的用户都和你有共同连接（好友、同群成员），符合 "assuming mutual connection" 前提；批量场景下性能也更好 |
+| 自己 | `into_self(true)` | 自己必须看到完整的 `relations` 列表和 `relationship=User`，这是 `into_known()` 给不了的 |
+
+### 18.2 混合策略下的 data layout
+
+Ready 事件发送到客户端后，用户数组的结构是：
+
+```
+users: [
+    // 其他用户们：into_known() 序列化
+    { id: "B", relationship: "Friend",   relations: [], online: true,  status: {...} },
+    { id: "C", relationship: "Blocked",  relations: [], online: false, status: null  },
+    { id: "D", relationship: "Incoming", relations: [], online: true,  status: {...} },
+    ...
+    // 最后一个：into_self() 序列化
+    { id: "A", relationship: "User",     relations: [            // ← 完整关系数组！
+        { _id: "B", status: "Friend"   },
+        { _id: "C", status: "Blocked"  },
+        { _id: "D", status: "Incoming" },
+        { _id: "E", status: "Outgoing" },
+        ...
+    ], online: true, status: {...} },
+]
+```
+
+**关键特征**：
+- 其他用户的 `relations` 都是空数组（`into_known()` 永远返回 `vec![]`）
+- 只有自己（最后一个元素）的 `relations` 有完整内容
+- 其他用户的 `relationship` 字段是"我对对方的关系状态"（从 `into_known()` 的 perspective 视角读取）
+
+### 18.3 客户端的反查机制
+
+客户端拿到 Ready 事件后，有**两套关系信息源**：
+
+**源 1：每个其他用户对象的 `relationship` 字段**
+- 已经是"我对这个人的关系"，直接显示即可
+- 用于 UI 渲染：好友列表标"好友"、请求列表标"待接受"、屏蔽按钮状态等
+
+**源 2：自己用户对象的 `relations` 数组**
+- 完整的关系索引表，按 `_id` 反查
+- 用于补充源 1 没有的信息，或在源 1 过期时做缓存
+
+### 18.4 为什么两套信息源可以并存？
+
+它们实际上是**完全冗余**的——因为 `into_known()` 中读取 `relationship` 的代码：
+
+```rust
+let relationship = perspective.relations
+    .as_ref()
+    .map(|relations| {
+        relations.iter()
+            .find(|r| r.id == self.id)          // 从 perspective.relations 中找
+            .map(|r| r.status.clone().into())
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
+```
+
+这里的 `perspective` 就是当前登录用户自己，`perspective.relations` 正是 `into_self()` 会返回的那个完整列表。所以：
+
+```
+other_user.relationship （源1）
+  = perspective.relations.find(|r| r.id == other_user.id).map(|r| r.status)
+  = my_relations.find(|r| r._id == other_user._id).map(|r| r.status)
+  = 通过源 2（自己的 relations）按 other_user._id 反查到的状态
+```
+
+两套信息源来自**同一个底层数据**，只是投影方式不同：
+- 源 1：把关系状态**散列**到每个对方用户对象上（方便 UI 直接读取）
+- 源 2：把关系状态**集中**在自己对象的数组里（方便批量查询和缓存）
+
+### 18.5 关系变更事件到来时的更新顺序
+
+当 `UserRelationship` 事件到达时（参见第 16 节，事件用 `into()` 序列化）：
+
+```
+客户端收到 { id: "B", user: { id: "B", relationship: "Friend", ... } }
+```
+
+客户端更新流程：
+
+1. **覆盖缓存中的 B 用户对象** → 源 1 自动更新（新的 relationship 已经在 user 对象里）
+2. **同时按 id 反查自己的 relations 数组** → 如果有 B 的条目，也更新那条的 status
+3. UI 重新渲染 → 从新的源 1 读取 relationship 显示
+
+因为两套源最终都指向同一个事实（数据库中的 relations 数组），所以无论先更新哪一个，最终都会一致。而且关系变更事件本身已经附带了正确的 relationship 值，所以即使不更新源 2，客户端也不会显示错误——只是源 2 暂时"脏"了，下次 Ready 或手动刷新时会自然同步。
+
+### 18.6 为什么 Ready 不直接给每个用户塞完整的 relations？
+
+1. **数据量控制**：如果每个用户都携带完整的 relations 数组，假设每个用户有 100 个关系，Ready 中有 100 个用户，总数据量就是 100 × 100 = 10,000 条关系记录。实际上只需要 100 条（自己的那份）就足够了。
+
+2. **信息安全**：其他用户的 relations 对客户端来说是**无意义的隐私数据**——你只需要知道你对对方是什么关系，不需要知道对方和其他人是什么关系。
+
+3. **视角一致性**：关系是"有向边"（A→B 和 B→A 可能不同），每个客户端只能看到**自己的视角**，这是由 perspective 机制保证的。如果给你看 B 的 relations 数组，你会看到 B 对其他人的关系，这在语义上和权限上都是不允许的。
