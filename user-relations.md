@@ -930,3 +930,284 @@ pub async fn apply_relationship(
 - 数据库中 target 是新状态，self 是旧状态
 
 这意味着**函数返回错误后，调用者手中的内存对象已经部分修改了**。但由于错误会通过 `?` 向上冒泡，API 层会直接返回错误给客户端，不会继续使用这些内存对象，所以这个问题在实际中不会造成影响。
+
+---
+
+## 10. None / User 状态在三处写入行为的确切分歧
+
+`set_relationship` 被三个实体执行，当状态为 `None` 或 `User` 时，三处的写入行为**并不一致**。这看似是 bug，实际上是刻意的设计分层。
+
+### 10.1 三处代码逐行对照
+
+**① 内存对象层**——[model.rs#L473-L476](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/models/users/model.rs#L473-L476)
+
+```rust
+if let RelationshipStatus::None | RelationshipStatus::User = status {
+    if let Some(relations) = &mut self.relations {
+        relations.retain(|relation| relation.id != user_b.id);  // 移除条目
+    }
+    // 注意：如果 self.relations 是 None，什么都不做
+}
+```
+
+**② 参考实现（内存数据库）**——[reference.rs#L120-L121](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/models/users/ops/reference.rs#L120-L121)
+
+```rust
+if let RelationshipStatus::User | RelationshipStatus::None = &relationship {
+    self.pull_relationship(user_id, target_id).await  // 转发到 pull
+}
+```
+
+`pull_relationship` 内部：[reference.rs#L145-L156](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/models/users/ops/reference.rs#L145-L156)
+
+```rust
+async fn pull_relationship(&self, user_id: &str, target_id: &str) -> Result<()> {
+    let mut users = self.users.lock().await;
+    let user = users.get_mut(user_id).ok_or_else(|| create_error!(NotFound))?;
+    if let Some(relations) = &mut user.relations {
+        relations.retain(|relation| relation.id != target_id);  // 移除条目
+    }
+    Ok(())
+}
+```
+
+**③ 生产实现（MongoDB）**——[mongodb.rs#L254-L256](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/models/users/ops/mongodb.rs#L254-L256)
+
+```rust
+if let RelationshipStatus::None = relationship {
+    return self.pull_relationship(user_id, target_id).await;  // 只判断 None，不判断 User
+}
+```
+
+`pull_relationship` 内部：[mongodb.rs#L300-L316](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/models/users/ops/mongodb.rs#L300-L316)
+
+```rust
+async fn pull_relationship(&self, user_id: &str, target_id: &str) -> Result<()> {
+    self.col::<User>(COL)
+        .update_one(
+            doc! { "_id": user_id },
+            doc! { "$pull": { "relations": { "_id": target_id } } },
+        )
+        .await ...
+}
+```
+
+### 10.2 分歧一览
+
+| 维度 | 内存对象层 | 参考实现 | MongoDB 生产实现 |
+|------|-----------|---------|-----------------|
+| **None 状态** | `retain` 移除条目 | 转发 `pull` → `retain` 移除条目 | 转发 `pull` → `$pull` 移除条目 |
+| **User 状态** | `retain` 移除条目 | 转发 `pull` → `retain` 移除条目 | ⚠️ **不拦截**，走主路径的 `$filter`+`$concatArrays` |
+| **效果差异** | None 和 User 行为一致 | None 和 User 行为一致 | None 走 `$pull`，User 走替换式写入 |
+
+### 10.3 这个分歧会不会出问题？
+
+**结论：不会**。原因是 `User` 状态（"对方就是自己"）在实际业务流中**永远不会作为参数传入** `set_relationship`。
+
+追查所有调用路径：
+
+```
+add_friend      → 传 None/Outgoing/Incoming/Friend
+remove_friend   → 传 None/None
+block_user      → 传 Blocked/BlockedOther/None
+unblock_user    → 传 BlockedOther/None/Blocked
+```
+
+没有任何业务方法会传入 `RelationshipStatus::User`。`User` 状态只在 `relationship_with()` 和 `user_relationship()` 中作为**读取时的特殊返回值**，表示"对方就是自己"，不会参与写入。
+
+因此 MongoDB 实现中 `if let RelationshipStatus::None = relationship` 只判断 `None` 而不判断 `User`，实际上是完全正确的——`User` 状态根本不会到达这里。参考实现多加了一个 `User` 判断属于防御性编程，无害但多余。
+
+### 10.4 三处行为的另一个细微差别
+
+当 `self.relations` 为 `None` 时：
+
+| 层 | 行为 |
+|----|------|
+| 内存对象层 | `if let Some(relations)` 不匹配 → **跳过，不操作** |
+| 参考实现 | `if let Some(relations)` 不匹配 → **跳过，不操作** |
+| MongoDB 生产实现 | `$filter` 在 `$ifNull` 保护下返回 `[]`，`$pull` 在空数组上也无害 → **始终执行 update_one，但无副作用** |
+
+这意味着：如果用户的 `relations` 字段本身是 `None`（从未有过任何关系），MongoDB 的 `$pull` 操作仍然会发出一次写操作（虽然不会实际修改任何数据），而内存实现则完全跳过。这是一个微小的性能差异，不影响正确性。
+
+---
+
+## 11. 待处理请求命中共同关系时的权限计算：是覆盖赋值而非叠加
+
+### 11.1 需要修正的说法
+
+前文第 8 节中对 `Incoming`/`Outgoing` 状态命中共同关系时的权限描述可能被理解为"叠加权限"，但代码实际是**覆盖赋值**。
+
+### 11.2 代码执行流精确分析
+
+位置：[permissions/impl.rs#L17-L39](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/permissions/src/impl.rs#L17-L39)
+
+```rust
+let mut permissions = 0_u64;                          // ← 初始化为 0
+match query.user_relationship().await {
+    RelationshipStatus::Friend => return u64::MAX.into(),
+    RelationshipStatus::Blocked | RelationshipStatus::BlockedOther => {
+        return (UserPermission::Access as u64).into()
+    }
+    RelationshipStatus::Incoming | RelationshipStatus::Outgoing => {
+        permissions = UserPermission::Access as u64;   // ← 覆盖赋值，不是 +=
+    }
+    _ => {}                                            // ← None 分支：permissions 保持 0
+}
+
+// 后续判断共同关系
+if query.have_mutual_connection().await {
+    permissions = UserPermission::Access as u64         // ← 再次覆盖赋值！
+                 + UserPermission::ViewProfile as u64;
+    ...
+}
+```
+
+### 11.3 关键：两次都是 `=` 不是 `+=`
+
+这意味着：
+
+**Incoming/Outgoing + 有共同关系**：
+
+```
+permissions = 0                                    // 初始化
+permissions = Access                               // match 分支覆盖赋值
+permissions = Access + ViewProfile                  // 共同关系分支覆盖赋值
+```
+
+最终：`Access + ViewProfile`
+
+**如果误以为是叠加（`+=`）**，会认为结果是 `Access + Access + ViewProfile = Access + ViewProfile`（Access 重复但位运算无影响，所以结果碰巧相同）。但意图是完全不同的：共同关系分支并**不是在 Incoming/Outgoing 的 Access 基础上追加 ViewProfile**，而是**用 Access+ViewProfile 完全替换掉之前的 Access**。
+
+**实际效果差异的证明——None 状态 + 有共同关系**：
+
+```
+permissions = 0                                    // 初始化
+// None 命中 _ => {} 分支，permissions 不变
+permissions = Access + ViewProfile                  // 共同关系分支覆盖赋值
+```
+
+最终：`Access + ViewProfile`
+
+对比 Incoming/Outgoing + 有共同关系，结果**完全相同**。也就是说，`Incoming`/`Outgoing` 分支中 `permissions = Access` 这个赋值在有共同关系的情况下**没有任何实际效果**，因为后面会被覆盖。它的意义仅体现在**没有共同关系**时：
+
+| 关系状态 | 有共同关系 | 最终权限 |
+|---------|-----------|---------|
+| None | ✅ | Access + ViewProfile |
+| None | ❌ | 0 |
+| Incoming/Outgoing | ✅ | Access + ViewProfile |
+| Incoming/Outgoing | ❌ | **Access** |
+| Friend | 任意 | 全开 |
+| Blocked/BlockedOther | 任意 | 仅 Access |
+
+所以 `Incoming`/`Outgoing` 分支的真正意义是：**即使没有共同服务器/群组，有待处理请求的双方也至少拥有 Access 权限**（可以看到对方的存在）。这与完全无关的陌生人（None + 无共同关系 → 0 权限）形成区别。
+
+---
+
+## 12. 机器人所有者分支的权限落点追踪
+
+### 12.1 代码路径
+
+位置：[permissions.rs#L56-L62](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/permissions.rs#L56-L62)
+
+```rust
+} else if let Some(bot) = &other_user.bot {
+    // For the purposes of permissions checks,
+    // assume owner is the same as bot
+    if self.perspective.id == bot.owner {
+        return RelationshipStatus::User;  // ← 机器人所有者看到的关系状态是 User
+    }
+}
+```
+
+**场景**：当前登录用户（perspective）是某个机器人的所有者，正在查询自己对那个机器人的权限。
+
+这段代码的含义是：**机器人所有者看待自己的机器人，等同于看待自己**，返回 `RelationshipStatus::User`。
+
+### 12.2 User 状态落入权限计算的哪条分支？
+
+回到 [permissions/impl.rs#L8-L46](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/permissions/src/impl.rs#L8-L46)：
+
+```rust
+pub async fn calculate_user_permissions<P: PermissionQuery>(query: &mut P) -> PermissionValue {
+    if query.are_we_privileged().await {
+        return u64::MAX.into();        // ① 特权检查
+    }
+    if query.are_the_users_same().await {
+        return u64::MAX.into();        // ② 同一人检查
+    }
+
+    let mut permissions = 0_u64;
+    match query.user_relationship().await {
+        RelationshipStatus::Friend => return u64::MAX.into(),
+        RelationshipStatus::Blocked | RelationshipStatus::BlockedOther => { ... }
+        RelationshipStatus::Incoming | RelationshipStatus::Outgoing => { ... }
+        _ => {}                         // ③ User 状态落在这里！
+    }
+    ...
+}
+```
+
+**`User` 状态落入 `_ => {}` 通配分支**，即 permissions 保持为 `0`。
+
+然后继续到共同关系判断：
+
+```rust
+if query.have_mutual_connection().await {
+    permissions = Access + ViewProfile;
+
+    if query.user_is_bot().await || query.are_we_a_bot().await {
+        permissions += SendMessage;
+    }
+}
+```
+
+### 12.3 但等等——② 号检查会先命中吗？
+
+关键问题：如果 perspective.id == bot.owner，`are_the_users_same()` 会不会在 ② 处就返回 `u64::MAX`？
+
+看 [permissions.rs#L43-L49](file:///d:/fz/0601-1/solo-dogfeeding/code/85-backend/crates/core/database/src/util/permissions.rs#L43-L49)：
+
+```rust
+async fn are_the_users_same(&mut self) -> bool {
+    if let Some(other_user) = &self.user {
+        self.perspective.id == other_user.id
+    } else {
+        false
+    }
+}
+```
+
+**不会命中**。`are_the_users_same()` 比较的是 `perspective.id == other_user.id`，而机器人所有者场景中 perspective.id 是 bot.owner，other_user.id 是 bot 的用户 ID。这两个 ID **不相同**（机器人和所有者是不同的用户账号），所以 ② 号检查不会提前返回。
+
+### 12.4 完整落点路径
+
+```
+机器人所有者查询对自己机器人的权限
+    ↓
+are_we_privileged() → false（一般不是特权用户）
+    ↓
+are_the_users_same() → false（owner_id ≠ bot_user_id）
+    ↓
+user_relationship() → User（因为 perspective.id == bot.owner）
+    ↓
+match User → _ => {} → permissions = 0
+    ↓
+have_mutual_connection() → 查询共同服务器/群组
+    ├─ 有共同关系 → permissions = Access + ViewProfile
+    │                + user_is_bot() == true → permissions += SendMessage
+    │                → 最终：Access + ViewProfile + SendMessage
+    └─ 无共同关系 → permissions = 0
+```
+
+### 12.5 这合理吗？
+
+机器人所有者查询自己机器人的权限时：
+
+- **有共同服务器/群组**：获得 `Access + ViewProfile + SendMessage`（因为 `user_is_bot()` 为 true，自动追加 `SendMessage`）
+- **无共同服务器/群组**：获得 `0` 权限
+
+这暴露了一个问题：机器人所有者**在没有任何共同服务器/群组的情况下，对自己的机器人没有任何权限**。看起来 `user_relationship()` 返回 `User` 的意图是让所有者对机器人拥有完全控制权，但实际上 `User` 状态在 `calculate_user_permissions` 中没有对应的全开分支，而是落入 `_ => {}` 被忽略。
+
+**对比真正的"自己看自己"**：当 perspective.id == other_user.id 时，② 号检查会直接返回 `u64::MAX`。而机器人所有者虽然被赋予 `User` 关系状态，却享受不到同等待遇。
+
+这可能是代码中的一个**逻辑缺陷**或**待完善的设计**：要么应该在 `calculate_user_permissions` 中给 `User` 分支加上 `return u64::MAX.into()`，要么应该让 `are_the_users_same()` 也检查机器人所有者关系。当前的行为意味着机器人所有者对机器人的权限取决于是否有共同连接，而不是像代码注释所说的"assume owner is the same as bot"。
