@@ -167,20 +167,290 @@ pub static ALLOW_IN_TIMEOUT: Lazy<u64> =
 
 ---
 
-## 四、频道级权限覆盖——优先级判定
+## 四、calculate_user_permissions 与用户关系权限
+
+在深入频道级权限之前，需要先理解独立的用户权限计算链路——它是 DM 频道权限的基础。
+
+### 4.1 calculate_user_permissions 完整流程
+
+[calculate_user_permissions](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L8-L46) 计算的是"我对某个用户有什么权限"，返回的是 `UserPermission` 位标志（不是 ChannelPermission）。
+
+完整决策树：
+
+```
+calculate_user_permissions(query)
+  │
+  ├─ 我是特权用户? → 是 → 返回 u64::MAX (所有权限)
+  ├─ 我们是同一个用户? → 是 → 返回 u64::MAX
+  │
+  ├─ 读取用户关系 relationship
+  │   ├─ Friend (好友) → 返回 u64::MAX
+  │   ├─ Blocked / BlockedOther (互相屏蔽) → 返回 Access (仅能访问)
+  │   ├─ Incoming / Outgoing (有未处理的好友请求) → 设置为 Access
+  │   └─ None / 其他 → 保持 0
+  │
+  └─ 是否有共同连接 (共同服务器)?
+      ├─ 否 → 返回当前 permissions
+      └─ 是 → permissions = Access + ViewProfile
+             ├─ 对方是 bot 或 我是 bot → 额外加 SendMessage
+             └─ 返回 permissions
+```
+
+**关系状态与权限映射表**：
+
+| RelationshipStatus | UserPermission | 说明 |
+|---|---|---|
+| `Friend` | `u64::MAX` (全部) | 好友完全信任 |
+| `Blocked` / `BlockedOther` | `Access` | 屏蔽状态仅可访问 |
+| `Incoming` / `Outgoing` | `Access` | 有好友请求待处理 |
+| `None` + 无共同服务器 | `0` | 完全无权限 |
+| `None` + 有共同服务器 | `Access + ViewProfile` | 可访问 + 可查看资料 |
+| 有共同服务器 + 一方是 bot | 追加 `SendMessage` | bot 可自动互发消息 |
+
+**注意**：这一链路计算的是 `UserPermission`（用户间权限，占低 4 位），不是 `ChannelPermission`（频道权限，占高位）。两者通过桥接转换。
+
+### 4.2 UserPermission 与 ChannelPermission 的位域隔离
+
+`PermissionValue(u64)` 是一个统一的 64 位容器，但两套权限枚举占据不同的位域：
+
+- `UserPermission`：bit 0-3（`Access=1<<0` 到 `Invite=1<<3`）
+- `ChannelPermission`：bit 0-39（52 个位标志，详见第一节）
+
+**位域重叠问题**：`UserPermission::Access` 和 `ChannelPermission::ManageChannel` 都是 `1 << 0`，值相同但语义完全不同。
+
+**has_user_permission vs has_channel_permission**：
+```rust
+// has_user_permission: 检查 UserPermission 位
+pub fn has_user_permission(&self, permission: UserPermission) -> bool {
+    self.has(permission as u64)  // 直接按位检查
+}
+
+// has_channel_permission: 检查 ChannelPermission 位
+pub fn has_channel_permission(&self, permission: ChannelPermission) -> bool {
+    self.has(permission as u64)  // 也是直接按位检查
+}
+```
+
+由于两套枚举的位定义不同（`UserPermission` 只定义了 4 个位，`ChannelPermission` 有 52 个），只要调用方使用正确的枚举类型，就不会混淆。但**返回值本身不携带类型信息**，使用时必须语义正确。
+
+### 4.3 桥接：从 UserPermission 到 ChannelPermission
+
+在 DirectMessage 频道中，`calculate_channel_permissions` 执行关键的桥接逻辑（[impl.rs#L94-L106](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L94-L106)）：
+
+```rust
+ChannelType::DirectMessage => {
+    if query.are_we_part_of_the_channel().await {
+        query.set_recipient_as_user().await;
+        let permissions = calculate_user_permissions(query).await;
+        if permissions.has_user_permission(UserPermission::SendMessage) {
+            (*DEFAULT_PERMISSION_DIRECT_MESSAGE).into()
+        } else {
+            (*DEFAULT_PERMISSION_VIEW_ONLY).into()
+        }
+    } else {
+        0_u64.into()
+    }
+}
+```
+
+**桥接三步曲**：
+1. `set_recipient_as_user()`：将查询对象切换为 DM 的另一个参与者
+2. `calculate_user_permissions()`：计算"我对他有什么 UserPermission"
+3. **判断 + 映射**：如果有 `UserPermission::SendMessage`（bit 2），则映射为完整的 DM 频道权限；否则映射为仅查看权限
+
+**桥接常量定义**：
+- `DEFAULT_PERMISSION_VIEW_ONLY` = `ViewChannel + ReadMessageHistory`
+- `DEFAULT_PERMISSION_DIRECT_MESSAGE` = `DEFAULT_PERMISSION + ManageChannel + React + Masquerade`
+  - 其中 `DEFAULT_PERMISSION` = `VIEW_ONLY + SendMessage + InviteOthers + SendEmbeds + UploadFiles + Connect + Speak + Listen + Video + React + ChangeNickname + ChangeAvatar`
+
+也就是说，**用户间的 `SendMessage` 权限直接决定了在 DM 频道中几乎所有交互权限**。这是一个全有或全无的映射。
+
+---
+
+## 五、ChannelType 五变体完整处理路径
+
+[ChannelType](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/channel.rs#L5-L11) 有五个变体：
+
+```rust
+pub enum ChannelType {
+    SavedMessages,    // 个人收藏
+    DirectMessage,    // 两人私聊
+    Group,            // 群聊（非服务器）
+    ServerChannel,    // 服务器频道
+    Unknown,          // 兜底
+}
+```
+
+注意：模型层的 `Channel` 枚举（[channels.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/models/src/v0/channels.rs#L13-L121)）有四个变体：`SavedMessages` / `DirectMessage` / `Group` / `TextChannel`，其中 `TextChannel` 对应权限层的 `ServerChannel`。
+
+### 5.1 变体一：SavedMessages（个人收藏）
+
+**处理路径**（[impl.rs#L87-L92](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L87-L92)）：
+
+```rust
+ChannelType::SavedMessages => {
+    if query.do_we_own_the_channel().await {
+        DEFAULT_PERMISSION_SAVED_MESSAGES.into()  // = GrantAllSafe
+    } else {
+        0_u64.into()
+    }
+}
+```
+
+- 只有拥有者（创建者）获得 `GrantAllSafe`（完全权限）
+- 其他人 0，完全无法访问
+- 不涉及任何角色或覆盖计算
+
+**数据模型**：`Channel::SavedMessages { id, user }` — 只存所有者 user_id。
+
+### 5.2 变体二：DirectMessage（两人私聊）
+
+**处理路径**（[impl.rs#L94-L106](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L94-L106)）：
+
+```rust
+ChannelType::DirectMessage => {
+    if query.are_we_part_of_the_channel().await {
+        query.set_recipient_as_user().await;
+        let permissions = calculate_user_permissions(query).await;
+        if permissions.has_user_permission(UserPermission::SendMessage) {
+            (*DEFAULT_PERMISSION_DIRECT_MESSAGE).into()
+        } else {
+            (*DEFAULT_PERMISSION_VIEW_ONLY).into()
+        }
+    } else {
+        0_u64.into()
+    }
+}
+```
+
+**决策链**：
+1. 非参与者 → 0
+2. 参与者 → 计算对另一个用户的 UserPermission
+3. 有 `UserPermission::SendMessage` → 完整 DM 权限（可发消息、可语音等）
+4. 无 `SendMessage` → 仅查看权限（只能看历史）
+
+**数据模型**：`Channel::DirectMessage { id, active, recipients: Vec<String> [2], last_message_id }` — 只有两个 recipients。
+
+### 5.3 变体三：Group（非服务器群聊）
+
+**处理路径**（[impl.rs#L108-L117](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L108-L117)）：
+
+```rust
+ChannelType::Group => {
+    if query.do_we_own_the_channel().await {
+        ChannelPermission::GrantAllSafe.into()
+    } else if query.are_we_part_of_the_channel().await {
+        (*DEFAULT_PERMISSION_VIEW_ONLY
+            | query.get_default_channel_permissions().await.allow)
+            .into()
+    } else {
+        0_u64.into()
+    }
+}
+```
+
+**决策链**：
+1. 非参与者 → 0
+2. 群拥有者 → `GrantAllSafe`（完全权限）
+3. 群成员 → `VIEW_ONLY | channel.permissions`
+
+**关键设计**：
+- Group 没有角色系统，只有单值 `permissions: Option<i64>`（[channels.rs#L62](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/models/src/v0/channels.rs#L62)）
+- 这个值被当作纯 allow 位来处理（deny 为 0），与 `VIEW_ONLY` 做 OR 运算确保成员至少能看到频道
+- `get_default_channel_permissions` 对 Group 的特殊处理（[bulk_permissions.rs#L140-L143](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L140-L143)）：
+
+```rust
+Channel::Group { permissions, .. } => Override {
+    allow: permissions.unwrap_or(*DEFAULT_PERMISSION_DIRECT_MESSAGE as i64) as u64,
+    deny: 0,
+},
+```
+
+默认值为 `DEFAULT_PERMISSION_DIRECT_MESSAGE`（与 DM 完整权限相同）。
+
+**数据模型**：`Channel::Group { id, name, owner, description, recipients, icon, last_message_id, permissions, nsfw }` — owner 拥有完全控制权，permissions 控制成员权限。
+
+### 5.4 变体四：ServerChannel（服务器频道）
+
+**处理路径**（[impl.rs#L119-L144](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L119-L144)）：
+
+```rust
+ChannelType::ServerChannel => {
+    query.set_server_from_channel().await;
+    if query.are_we_server_owner().await {
+        ChannelPermission::GrantAllSafe.into()
+    } else if query.are_we_a_member().await {
+        let mut permissions = calculate_server_permissions(query).await;
+        permissions.apply(query.get_default_channel_permissions().await);
+        for role_override in query.get_our_channel_role_overrides().await {
+            permissions.apply(role_override);
+        }
+        if query.are_we_timed_out().await {
+            permissions.restrict(*ALLOW_IN_TIMEOUT);  // 第二次 restrict
+        }
+        if !permissions.has_channel_permission(ChannelPermission::ViewChannel) {
+            permissions.revoke_all();
+        }
+        permissions
+    } else {
+        0_u64.into()
+    }
+}
+```
+
+**完整流程详见第四节**，这里补充两个关键细节：
+
+1. **`set_server_from_channel()`**：从频道的 `server` 字段加载所属服务器数据，这是服务器级权限计算的前提。
+2. **拥有者快捷路径**：服务器拥有者直接获得 `GrantAllSafe`，绕过所有角色叠加计算——这是一个优化，也确保拥有者永远不会被 Timeout 或频道覆盖限制。
+
+**数据模型**：`Channel::TextChannel { id, server, name, description, icon, last_message_id, default_permissions, role_permissions, nsfw, voice, slowmode }` — 完整的服务器频道，有 `default_permissions`（OverrideField）和 `role_permissions`（HashMap<String, OverrideField>）。
+
+### 5.5 变体五：Unknown（兜底）
+
+**处理路径**（[impl.rs#L145](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L145)）：
+
+```rust
+ChannelType::Unknown => 0_u64.into(),
+```
+
+**设计意图**：
+- 这是一个**防御性兜底**，对应数据库中可能存在的未知频道类型（如未来新增的类型在旧版本代码中无法识别）
+- 返回 0 确保"未知即无权限"的安全失败模式
+- 不会 panic，不会崩溃，优雅降级
+
+**何时会出现 Unknown**：
+- `BulkDatabasePermissionQuery::get_channel_type()` 中 `channel: None` 时返回 `Unknown`（[bulk_permissions.rs#L164-L166](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L164-L166)）
+- 反序列化时遇到未知的 `channel_type` 标签（如果数据模型有 `#[serde(other)]` 之类的标记）
+
+### 5.6 五变体全景总结
+
+| 变体 | 权限计算复杂度 | 角色系统 | Timeout 影响 | 语音开关影响 |
+|---|---|---|---|---|
+| `SavedMessages` | 极低（own? yes/no） | ❌ 无 | ❌ 不适用 | ❌ 不适用 |
+| `DirectMessage` | 低（用户关系 + 桥接） | ❌ 无 | ❌ 不适用 | ❌ 不适用 |
+| `Group` | 低（owner/member 二分 + 单值 permissions） | ❌ 无 | ❌ 不适用 | ❌ 不适用 |
+| `ServerChannel` | 极高（服务器默认 + 服务器角色 + 频道默认 + 频道角色 + 二次 restrict） | ✅ 完整 | ✅ 双重 restrict | ✅ 服务器级检查 |
+| `Unknown` | 无（硬编码 0） | ❌ 无 | ❌ 不适用 | ❌ 不适用 |
+
+只有 `ServerChannel` 经过完整的多层权限叠加和后处理，这也是为什么 Timeout 二次 restrict 只在这个分支存在——其他类型要么没有 Timeout 概念，要么权限模型简单不需要。
+
+---
+
+## 六、频道级权限覆盖——优先级判定
 
 入口函数为 [calculate_channel_permissions](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L81-L147)。
 
-### 4.1 按频道类型的分支逻辑
+### 6.1 按频道类型的分支逻辑
 
 | 频道类型 | 权限来源 |
 |---|---|
 | `SavedMessages` | 仅拥有者获得 `GrantAllSafe`，其余为 0 |
-| `DirectMessage` | 基于用户间关系计算 `UserPermission`，再叠加 `DEFAULT_PERMISSION_DIRECT_MESSAGE` 或 `DEFAULT_PERMISSION_VIEW_ONLY` |
+| `DirectMessage` | 基于用户间关系计算 `UserPermission`，再桥接映射到 `DEFAULT_PERMISSION_DIRECT_MESSAGE` 或 `DEFAULT_PERMISSION_VIEW_ONLY` |
 | `Group` | 拥有者获得 `GrantAllSafe`；参与者获得 `DEFAULT_PERMISSION_VIEW_ONLY | channel.permissions` |
-| `ServerChannel` | **三层叠加**（详见下文） |
+| `ServerChannel` | **三层叠加**（详见下文），含二次 Timeout restrict 和 ViewChannel 守卫 |
+| `Unknown` | 硬编码 0（安全兜底） |
 
-### 4.2 ServerChannel 的三层权限叠加
+### 6.2 ServerChannel 的三层权限叠加
 
 这是最核心的权限计算路径，代码在 [impl.rs#L119-L144](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L119-L144)：
 
@@ -201,7 +471,7 @@ pub static ALLOW_IN_TIMEOUT: Lazy<u64> =
   └─ ViewChannel 检查：若无 ViewChannel 权限，直接 revoke_all()
 ```
 
-### 4.3 频道角色覆盖的选取逻辑
+### 6.3 频道角色覆盖的选取逻辑
 
 [get_our_channel_role_overrides](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs#L252-L290)：
 
@@ -209,7 +479,7 @@ pub static ALLOW_IN_TIMEOUT: Lazy<u64> =
 2. **关键步骤**：还要在 `server.roles` 中查到该角色才能使用——如果角色已被删除，`server.roles.get(id)` 返回 `None`，该条目会被 `filter_map` 过滤掉
 3. 按 `role.rank` 降序排列后依次 apply
 
-### 4.4 完整优先级链（从低到高）
+### 6.4 完整优先级链（从低到高）
 
 ```
 server.default_permissions         ← 最底层：所有人都有
@@ -225,7 +495,7 @@ Timeout / 语音开关 / ViewChannel 检查
 
 **核心原则**：后执行的 `apply` 覆盖先执行的结果。同一层内，低 rank（高优先级）角色的 allow 可以恢复被高 rank 角色 deny 掉的权限，反之亦然。
 
-### 4.5 测试用例验证
+### 6.5 测试用例验证
 
 [test.rs#L205-L315](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/test.rs#L205-L315) 中的 `validate_server_permissions` 测试精确展示了三层叠加：
 
@@ -239,9 +509,9 @@ Timeout / 语音开关 / ViewChannel 检查
 
 ---
 
-## 五、批量权限计算入口
+## 七、批量权限计算入口
 
-### 5.1 单用户入口：DatabasePermissionQuery
+### 7.1 单用户入口：DatabasePermissionQuery
 
 [DatabasePermissionQuery](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs#L12-L26) 是面向单用户的 Builder 模式权限计算器：
 
@@ -258,13 +528,19 @@ let perms = calculate_channel_permissions(&mut query).await;
 - 数据层（`DatabasePermissionQuery`）负责从 MongoDB 获取 User / Server / Member / Channel 数据
 - 逻辑层（`calculate_*` 函数）只依赖 trait 方法，完全无数据库依赖
 
-### 5.2 批量入口：BulkDatabasePermissionQuery
+### 7.2 批量入口：BulkDatabasePermissionQuery
 
 [BulkDatabasePermissionQuery](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L11-L25) 用于一次计算多个成员在某个频道上的权限，核心场景是判断"哪些成员能看到这个频道"。
 
+**频道类型支持澄清**：
+- 结构体本身设计上支持多种频道类型：内部 `get_channel_type()` 方法可以区分 `SavedMessages` / `DirectMessage` / `Group` / `ServerChannel` / `Unknown`
+- `get_default_channel_permissions()` 方法也为 `Group` 和 `TextChannel` 分别实现了权限映射
+- 但 **`calculate_members_permissions` 核心计算函数仅支持 TextChannel**（属于 ServerChannel 的一种），其他类型调用会直接 `panic!`
+- 原因：`BulkDatabasePermissionQuery::new()` 强制要求传入 `Server` 参数，它本质上是**服务器上下文下的批量计算器**，非服务器频道（DM/Group/SavedMessages）没有服务器归属，因此不在设计范围内
+
 核心方法 [calculate_members_permissions](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L186-L313)：
 
-1. 解构频道数据：`id`, `role_permissions`, `default_permissions`
+1. 解构频道数据：`id`, `role_permissions`, `default_permissions`（仅 TextChannel）
 2. 确保用户列表和成员列表都存在（缺失则从数据库批量拉取）
 3. 对每个用户：
    - 非成员 → 0
@@ -272,7 +548,6 @@ let perms = calculate_channel_permissions(&mut query).await;
    - 调用 [calculate_server_permissions](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L316-L345)（同步版本，直接操作数据而非 trait）
    - apply 频道默认权限
    - 按 rank 排序后 apply 频道角色覆盖
-   - 检查 Timeout
 
 典型调用：
 
@@ -285,7 +560,7 @@ BulkDatabasePermissionQuery::new(db, server)
 // → HashMap<String, bool>：每个成员是否能看到该频道
 ```
 
-### 5.3 权限验证辅助
+### 7.3 权限验证辅助
 
 [PermissionValue](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L14-L114) 提供了两个关键验证方法：
 
@@ -297,9 +572,9 @@ BulkDatabasePermissionQuery::new(db, server)
 
 ---
 
-## 六、角色删除后的权限回收——连锁影响
+## 八、角色删除后的权限回收——连锁影响
 
-### 6.1 删除入口
+### 8.1 删除入口
 
 [roles_delete.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_delete.rs#L16-L49) 是角色删除的 HTTP 入口：
 
@@ -313,7 +588,7 @@ pub async fn delete(db, user, target, role_id, voice_client) -> Result<EmptyResp
 }
 ```
 
-### 6.2 数据库层连锁操作
+### 8.2 数据库层连锁操作
 
 [delete_role](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/servers/ops/mongodb.rs#L113-L156) 执行三步原子操作：
 
@@ -353,7 +628,7 @@ db.servers.updateOne(
 )
 ```
 
-### 6.3 "幽灵覆盖"问题分析
+### 8.3 "幽灵覆盖"问题分析
 
 由于第二步只清理了第一个频道，其他频道中 `channel.role_permissions` 里可能仍残留已删除角色的覆盖条目。然而，这不会导致运行时错误，原因是：
 
@@ -375,7 +650,7 @@ db.servers.updateOne(
 2. 如果未来以相同 ID 重新创建角色，残留的覆盖条目会意外生效
 3. 成员 `roles` 列表中也会残留（第一步用了 `updateMany` 是正确的，但需确认所有成员都被清理）
 
-### 6.4 语音权限同步
+### 8.4 语音权限同步
 
 角色删除后，路由层遍历服务器所有频道，调用 [sync_voice_permissions](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/voice/mod.rs#L441-L466)：
 
@@ -388,7 +663,7 @@ for channel_id in &server.channels {
 
 这确保了正在语音频道中的成员在角色被删除后，其语音权限（Connect / Speak / Video 等）立即被重新计算并同步到 LiveKit 语音服务器。
 
-### 6.5 成员 ranking 的变化
+### 8.5 成员 ranking 的变化
 
 [Member::get_ranking](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/server_members/model.rs#L243-L254) 取成员所有角色中的最小 rank 值（最高优先级）：
 
@@ -411,7 +686,7 @@ pub fn get_ranking(&self, server: &Server) -> i64 {
 - 无法操作原来能操作的频道权限
 - 踢人/封禁等操作的"低于自己 ranking"的范围缩小
 
-### 6.6 事件通知
+### 8.6 事件通知
 
 [Role::delete](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/servers/model.rs#L381-L391) 会发布 `ServerRoleDelete` 事件：
 
@@ -426,7 +701,7 @@ EventV1::ServerRoleDelete {
 
 客户端收到此事件后应本地移除该角色的 UI 显示和缓存，但**不会自动重新计算权限**——客户端通常需要在下次操作时才会触发权限重新计算。
 
-### 6.7 连锁影响总结图
+### 8.7 连锁影响总结图
 
 ```
 角色删除
@@ -453,9 +728,9 @@ EventV1::ServerRoleDelete {
 
 ---
 
-## 七、权限设置时的安全校验
+## 九、权限设置时的安全校验
 
-### 7.1 服务器级角色权限设置
+### 9.1 服务器级角色权限设置
 
 [permissions_set.rs (server)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/permissions_set.rs#L16-L61)：
 
@@ -463,7 +738,7 @@ EventV1::ServerRoleDelete {
 2. 不能修改 rank ≥ 自己 ranking 的角色
 3. 通过 `throw_permission_override` 确保不能授予自己没有的权限
 
-### 7.2 频道级角色权限设置
+### 9.2 频道级角色权限设置
 
 [permissions_set.rs (channel)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/channels/permissions_set.rs#L15-L56)：
 
@@ -471,18 +746,18 @@ EventV1::ServerRoleDelete {
 2. 不能修改 rank ≥ 自己 ranking 的角色
 3. 同样通过 `throw_permission_override` 校验
 
-### 7.3 默认权限设置
+### 9.3 默认权限设置
 
 - 服务器默认权限：[permissions_set_default.rs (server)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/permissions_set_default.rs) — 需要 `ManagePermissions`，且只能设置自己拥有的权限
 - 频道默认权限：[permissions_set_default.rs (channel)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/channels/permissions_set_default.rs) — 需要 `ManagePermissions`，`Group` 使用纯 allow 值，`TextChannel` 使用 Override（allow/deny）
 
 ---
 
-## 九、两条权限计算路径的深度对比
+## 十、两条权限计算路径的深度对比
 
 系统中存在两条独立的权限计算路径：**单用户 trait 路径**和**批量同步路径**。两者计算结果在服务器级应该一致，但在频道级和后处理阶段存在结构性差异。
 
-### 9.1 架构对比总览
+### 10.1 架构对比总览
 
 | 维度 | 单用户 trait 路径 | 批量同步路径 |
 |---|---|---|
@@ -496,7 +771,7 @@ EventV1::ServerRoleDelete {
 | ViewChannel 守卫 | ✅ 无 `ViewChannel` 则 `revoke_all()` | ❌ **缺失** |
 | 成员身份未知时 | 自动从 DB 补拉成员 | 直接判 0 |
 
-### 9.2 两条路径的 `calculate_server_permissions` 逐行对比
+### 10.2 两条路径的 `calculate_server_permissions` 逐行对比
 
 **单用户 trait 版本** — [impl.rs#L49-L78](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L49-L78)：
 
@@ -550,7 +825,7 @@ fn calculate_server_permissions(server: &Server, user: &User, member: &Member) -
 | 语音开关 | ✅ 检查 `can_publish`/`can_receive` | ❌ **完全缺失** | **行为差异** |
 | Timeout | ✅ | ✅ | 等价 |
 
-### 9.3 频道级计算的差异
+### 10.3 频道级计算的差异
 
 单用户路径的 `calculate_channel_permissions` 在 `ServerChannel` 分支中（[impl.rs#L119-L144](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L119-L144)）执行了三步后处理：
 
@@ -562,15 +837,98 @@ fn calculate_server_permissions(server: &Server, user: &User, member: &Member) -
 这意味着：
 - 批量路径可能返回一个没有 `ViewChannel` 权限但仍有其他权限位的非零值
 - `members_can_see_channel` 通过 `has_channel_permission(ChannelPermission::ViewChannel)` 单独检查弥补了 ViewChannel 守卫的缺失，但其他使用批量权限值的场景可能出问题
-- 批量路径的 Timeout 限制仅在服务器级生效（`calculate_server_permissions` 同步版中），频道级不再二次 restrict——但由于 `restrict` 是 AND 操作，重复执行结果相同，所以实际差异仅在于语音开关的缺失
+- 批量路径的 Timeout 限制仅在服务器级生效（`calculate_server_permissions` 同步版中），频道级不再二次 restrict——**这是真正的行为差异**，详见 10.4 节对二次 restrict 必要性的深度分析。
+
+### 10.4 Timeout 二次 restrict 的必要性深度分析
+
+#### 10.4.1 问题：为什么要 restrict 两次？
+
+之前的分析认为"restrict 是 AND 操作，重复执行结果相同"——这是**错误的**。二次 restrict 不是冗余，而是防止频道覆盖绕过 Timeout 限制的关键安全防线。
+
+完整的权限计算时序：
+
+```
+① 服务器默认权限
+    ↓ apply
+② 服务器角色 Override
+    ↓
+③ 服务器级 Timeout restrict → 只剩 ViewChannel + ReadMessageHistory
+    ↓ apply
+④ 频道默认 Override    ← 这里可能 allow 了 SendMessage 等！
+    ↓ apply
+⑤ 频道角色 Override    ← 这里也可能 allow 了更多权限！
+    ↓
+⑥ 频道级 Timeout restrict → 再次限制到 ViewChannel + ReadMessageHistory
+    ↓
+⑦ ViewChannel 守卫检查
+```
+
+**关键问题**：步骤 ③ 已经 restrict 了，但步骤 ④ 和 ⑤ 的 `apply` 操作（OR allow，AND NOT deny）可以恢复被 restrict 掉的权限位。
+
+#### 10.4.2 数学上的证明
+
+`restrict(v)` 执行 `self.0 &= v`，将权限值限制在 `v` 的位空间内。
+
+`apply(o)` 执行：
+```
+self.0 |= o.allow    ← OR 操作可以设置位
+self.0 &= !o.deny    ← AND NOT 操作只能清除位
+```
+
+如果 `o.allow` 中包含了不在 `v` 中的位，`apply` 就可以"绕过"之前的 `restrict`。
+
+**示例**：
+```
+初始: 0b1111 (全权限)
+restrict(ALLOW_IN_TIMEOUT = 0b0011) → 0b0011 (只有 ViewChannel + ReadMessageHistory)
+apply(Override { allow: 0b0100 (SendMessage), deny: 0 })
+  → 0b0011 | 0b0100 = 0b0111
+  → SendMessage 被恢复了！
+第二次 restrict(0b0011) → 0b0111 & 0b0011 = 0b0011
+  → 重新清零 SendMessage
+```
+
+没有第二次 restrict，Timeout 成员只需频道覆盖 allow 了 SendMessage，就能发送消息——这是严重的权限泄漏。
+
+#### 10.4.3 批量路径的缺失风险
+
+批量路径 `calculate_members_permissions` 缺少第二次 restrict：
+
+```rust
+// calculate_server_permissions 同步版中做了第一次 restrict
+if member.in_timeout() {
+    permissions.restrict(*ALLOW_IN_TIMEOUT);
+}
+
+// 然后 apply 频道默认和频道角色覆盖——这两步可以恢复权限！
+if let Some(defaults) = channel_default_permissions {
+    permission.apply(defaults.into());
+}
+for role_override in overrides {
+    permission.apply(role_override);
+}
+
+// ❌ 没有第二次 restrict！
+```
+
+**风险场景**：
+1. 用户被 Timeout，服务器级 restrict 后只剩 `ViewChannel + ReadMessageHistory`
+2. 频道默认权限的 `allow` 包含 `SendMessage`
+3. 批量计算返回的权限值会包含 `SendMessage`
+4. 但 `members_can_see_channel` 只检查 `ViewChannel`，所以当前使用场景不受影响
+5. 如果未来复用该函数用于其他权限判断（如是否能发送消息），就会出现权限泄漏
+
+#### 10.4.4 安全结论
+
+二次 restrict 是**必需的防御性编程**，不是冗余。批量路径的缺失是一个潜在的安全隐患，在扩展使用场景前需要补齐。
 
 ---
 
-## 十、批量补拉机制：missing_users 与 missing_members
+## 十一、批量补拉机制：missing_users 与 missing_members
 
 `BulkDatabasePermissionQuery` 的 Builder 模式允许调用方只提供 `users` 或 `members` 其中之一，缺失的另一个维度会在计算时自动补拉。
 
-### 10.1 补拉逻辑
+### 11.1 补拉逻辑
 
 位于 [calculate_members_permissions](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L206-L245)：
 
@@ -586,7 +944,7 @@ fn calculate_server_permissions(server: &Server, user: &User, member: &Member) -
   → 存入 cached_members 和 members
 ```
 
-### 10.2 双缓存设计
+### 11.2 双缓存设计
 
 ```rust
 pub struct BulkDatabasePermissionQuery<'a> {
@@ -602,7 +960,7 @@ pub struct BulkDatabasePermissionQuery<'a> {
 - `cached_*` 标记"这些数据是补拉产生的，属于调用方不持有的额外数据"，供外部读取
 - `users` / `members` 是实际计算用的列表
 
-### 10.3 Builder 的互斥约束
+### 11.3 Builder 的互斥约束
 
 [`.members()`](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L112-L121) 和 [`.users()`](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L123-L132) 两个 Builder 方法会**互斥清空**对方：
 
@@ -632,7 +990,7 @@ pub fn users(self, users: &'z [User]) -> BulkDatabasePermissionQuery<'z> {
 
 这确保了不会出现"旧 users + 新 members"的不一致状态。任一 setter 调用后，另一维度必然为 `None`，需要在 `calculate_members_permissions` 中补拉。
 
-### 10.4 成员查找效率
+### 11.4 成员查找效率
 
 补拉完成后，成员列表被转为 HashMap 以实现 O(1) 查找（[bulk_permissions.rs#L247-L254](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L247-L254)）：
 
@@ -648,9 +1006,9 @@ let members: HashMap<&String, &Member, RandomState> = HashMap::from_iter(
 
 ---
 
-## 十一、Timeout 和语音开关在两条链路中的位置差异
+## 十二、Timeout 和语音开关在两条链路中的位置差异
 
-### 11.1 单用户链路中的完整后处理链
+### 12.1 单用户链路中的完整后处理链
 
 ```
 calculate_channel_permissions (ServerChannel 分支)
@@ -672,9 +1030,9 @@ calculate_channel_permissions (ServerChannel 分支)
 1. 服务器级（`calculate_server_permissions` 内）：角色叠加后 restrict
 2. 频道级（`calculate_channel_permissions` 的 `ServerChannel` 分支）：频道覆盖后再次 restrict
 
-第二次 restrict 是防御性的——理论上，如果频道覆盖的 allow 包含了 `ViewChannel` 或 `ReadMessageHistory` 之外的权限，第二次 restrict 会将其收回。但由于 `restrict` 是 AND 操作，而第一次 restrict 已经将权限限制到 `ALLOW_IN_TIMEOUT`（只有 ViewChannel + ReadMessageHistory），频道覆盖不可能恢复超出此范围的权限（因为角色的 allow 位中不可能有超出 ALLOW_IN_TIMEOUT 的位被设置——除非角色显式 allow 了其他权限）。**因此第二次 restrict 的实际效果是：即使频道覆盖 allow 了额外权限，Timeout 成员仍无法获得。**
+**第二次 restrict 是绝对必需的**——不是冗余防御。第一次 restrict 后，频道默认权限和频道角色覆盖的 `apply` 操作（OR allow）可以恢复被 restrict 掉的权限位。第二次 restrict 确保即使频道覆盖 allow 了 `SendMessage` 等额外权限，Timeout 成员仍然被限制在 `ALLOW_IN_TIMEOUT`（只有 ViewChannel + ReadMessageHistory）。详见 10.4 节的数学证明。
 
-### 11.2 批量链路中的后处理链
+### 12.2 批量链路中的后处理链
 
 ```
 calculate_members_permissions
@@ -703,9 +1061,9 @@ calculate_members_permissions
 
 ---
 
-## 十二、throw_permission_override 位运算拦截机制
+## 十三、throw_permission_override 位运算拦截机制
 
-### 12.1 拦截逻辑详解
+### 13.1 拦截逻辑详解
 
 [throw_permission_override](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L92-L113) 是权限委托安全的核心守卫，防止用户将自身不具备的权限授予他人。
 
@@ -762,7 +1120,7 @@ if !self.has(!current_value.allows() & next_value.allows())
 
 移除的 deny 位（从拒绝变为中性/允许）操作者必须拥有。你不能"解禁"你本身不具备的权限——因为解禁等同于授予。
 
-### 12.2 位运算真值表
+### 13.2 位运算真值表
 
 | 旧 allow | 新 allow | 旧 deny | 新 deny | 含义 | 需要检查 |
 |---|---|---|---|---|---|
@@ -777,7 +1135,7 @@ if !self.has(!current_value.allows() & next_value.allows())
 
 **核心原则**：只有"扩大权限范围"的操作才需要拦截——包括新增 allow 和移除 deny。"缩小权限范围"的操作（新增 deny、撤销 allow）总是允许的。
 
-### 12.3 调用位置
+### 13.3 调用位置
 
 | 路由 | 文件 | 场景 |
 |---|---|---|
@@ -788,11 +1146,11 @@ if !self.has(!current_value.allows() & next_value.allows())
 
 ---
 
-## 十三、角色 Rank 互锁机制
+## 十四、角色 Rank 互锁机制
 
 Rank 互锁是权限系统的层级安全守卫，确保低优先级角色的持有者无法操作高优先级角色。互锁贯穿于角色编辑、角色删除、角色排序、成员编辑四个操作。
 
-### 13.1 互锁基础：Member::get_ranking
+### 14.1 互锁基础：Member::get_ranking
 
 [get_ranking](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/server_members/model.rs#L243-L254) 取成员所有角色中的最小 rank 值：
 
@@ -812,7 +1170,7 @@ pub fn get_ranking(&self, server: &Server) -> i64 {
 
 **无角色成员的 ranking = `i64::MAX`**（最低优先级），拥有 rank=0 角色的成员 ranking=0（最高优先级）。服务器拥有者不经过此计算，直接拥有绝对权限。
 
-### 13.2 互锁在角色删除中的体现
+### 14.2 互锁在角色删除中的体现
 
 [roles_delete.rs#L29-L38](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_delete.rs#L29-L38)：
 
@@ -828,7 +1186,7 @@ if role.rank <= member_rank {
 
 `unwrap_or(i64::MIN)` 处理了成员不在服务器中的极端情况——此时 `i64::MIN` 确保几乎所有角色的 rank 都大于它，从而阻止操作。
 
-### 13.3 互锁在角色编辑中的体现
+### 14.3 互锁在角色编辑中的体现
 
 [roles_edit.rs#L38-L44](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_edit.rs#L38-L44)：
 
@@ -844,7 +1202,7 @@ if let Some(mut role) = server.roles.remove(&role_id) {
 
 与删除逻辑完全一致：不能编辑 rank 不高于自己的角色。注意编辑只涉及角色元数据（名称、颜色、图标），不涉及权限修改——权限修改走 `permissions_set` 路由。
 
-### 13.4 互锁在角色排序中的体现
+### 14.4 互锁在角色排序中的体现
 
 [roles_edit_positions.rs#L45-L69](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_edit_positions.rs#L45-L69)：
 
@@ -872,7 +1230,7 @@ if server.owner != user.id {
 - 你不能把低于你的角色往上挪到高于你的位置（提升其优先级）
 - 你只能在自己排名以下的角色之间重新排序
 
-### 13.5 互锁在成员编辑中的双重体现
+### 14.5 互锁在成员编辑中的双重体现
 
 [member_edit.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/member_edit.rs) 包含两层互锁：
 
@@ -923,7 +1281,7 @@ if data.timeout.is_some() {
 
 Timeout 操作除了需要 `TimeoutMembers` 权限外，还有反向检查：如果目标成员拥有 `TimeoutMembers` 权限，则不能对其执行 Timeout。这是一种"同级保护"——拥有管理权限的成员不能被互相 Timeout。
 
-### 13.6 Rank 互锁全景图
+### 14.6 Rank 互锁全景图
 
 ```
 操作               互锁检查                              代码位置
@@ -942,7 +1300,7 @@ Timeout 操作除了需要 `TimeoutMembers` 权限外，还有反向检查：如
 
 ---
 
-## 十四、关键代码索引
+## 十五、关键代码索引
 
 | 职责 | 文件 |
 |---|---|
