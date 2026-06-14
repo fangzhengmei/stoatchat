@@ -219,6 +219,200 @@ Reference 后端中以下方法直接 `todo!()`，调用会 panic：
 |---------|-----------|
 | 如果找到 `pending_deletion_at` 的记录，用 `find_one_and_update` 合并（重置 joined_at，清除 pending_deletion_at），返回更新后的 Member | 如果 key 已存在直接报错 `create_database_error!("insert", "member")`，不处理合并 |
 
+### 4.7 消息存取接口深度差异
+
+消息模型（`AbstractMessages`）是两套后端差异最密集的领域。以下逐接口展开分析。
+
+---
+
+#### 4.7.1 `delete_messages`——Reference 的 retain 条件与 MongoDB 语义不一致
+
+**Trait 签名**（[ops.rs#L44](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops.rs#L44)）：
+
+```rust
+async fn delete_messages(&self, channel: &str, ids: &[String]) -> Result<()>;
+```
+
+语义意图：删除 **同时满足** "属于指定 channel" **且** "ID 在 ids 列表中" 的消息。
+
+**MongoDB 实现**（[mongodb.rs#L300-L312](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/mongodb.rs#L300-L312)）：
+
+```rust
+self.col::<Document>(COL)
+    .delete_many(doc! {
+        "channel": channel,
+        "_id": { "$in": ids }
+    })
+    .await
+```
+
+删除条件：`channel == channel AND _id IN ids`，是 **AND 合取**。
+
+**Reference 实现**（[reference.rs#L282-L289](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L282-L289)）：
+
+```rust
+self.messages
+    .lock()
+    .await
+    .retain(|id, message| message.channel != channel && !ids.contains(id));
+```
+
+保留条件：`channel != channel AND id NOT IN ids`。
+
+**逻辑推导**：
+
+| 条件 | MongoDB 保留（delete 的否定） | Reference 保留 |
+|------|------------------------------|----------------|
+| De Morgan 展开 | `channel != channel ∨ id NOT IN ids` | `channel != channel ∧ id NOT IN ids` |
+
+正确 retain 应为 **OR**（De Morgan 定律），但 Reference 写成了 **AND**。
+
+**用例推演**（假设 `channel = "ch1"`, `ids = ["msgB"]`）：
+
+| 消息 | channel | id | MongoDB 行为 | Reference 行为 | 差异 |
+|------|---------|----|-------------|---------------|------|
+| A | "ch1" | "msgA" | 保留（id 不在 ids 中） | **删除**（channel 匹配 ∧ id 不在 ids → AND 不满足 → 不保留） | 🔴 误删同频道非目标消息 |
+| B | "ch2" | "msgB" | 保留（channel 不匹配） | **删除**（channel 不匹配 ∧ id 在 ids 中 → AND 不满足 → 不保留） | 🔴 误删跨频道消息 |
+| C | "ch1" | "msgB" | 删除（两个条件都匹配） | 删除（channel 匹配 ∧ id 在 ids → 都不满足 → 不保留） | ✅ 一致 |
+| D | "ch2" | "msgA" | 保留（两个条件都不匹配） | 保留（channel 不匹配 ∧ id 不在 ids → 都满足 → 保留） | ✅ 一致 |
+
+**结论**：Reference 实现把 AND 误写为 AND（而非正确的 OR），导致除了"同时满足两个删除条件"的消息外，**所有其他消息也被错误删除**。正确写法应为：
+
+```rust
+.retain(|id, message| message.channel != channel || !ids.contains(id));
+//                                             ^^          ^
+```
+
+这是整个消息模块最严重的逻辑 Bug——任何一次批量删除都会清空整个 messages HashMap。
+
+---
+
+#### 4.7.2 `fetch_messages`——全文索引与子串匹配的本质差异
+
+**Trait 签名**（[ops.rs#L20](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops.rs#L20)）：
+
+```rust
+async fn fetch_messages(&self, query: MessageQuery) -> Result<Vec<Message>>;
+```
+
+`MessageFilter` 中的搜索字段定义（[model.rs#L184-L193](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/model.rs#L184-L193)）：
+
+```rust
+pub struct MessageFilter {
+    pub channel: Option<String>,
+    pub author: Option<String>,
+    pub query: Option<String>,      // "Search query"
+    pub pinned: Option<bool>,       // "Search for pinned"
+}
+```
+
+**MongoDB 实现**（[mongodb.rs#L45-L56](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/mongodb.rs#L45-L56)）：
+
+```rust
+let is_search_query = if let Some(query) = query.filter.query {
+    filter.insert(
+        "$text",
+        doc! { "$search": query },
+    );
+    true
+} else {
+    false
+};
+```
+
+**Reference 实现**（[reference.rs#L51-L58](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L51-L58)）：
+
+```rust
+if let Some(query) = &query.filter.query {
+    if let Some(content) = &message.content {
+        if !content.to_lowercase().contains(query) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+}
+```
+
+两者的搜索机制存在 **六个维度** 的本质差异：
+
+| 维度 | MongoDB `$text` | Reference `to_lowercase().contains()` |
+|------|-----------------|---------------------------------------|
+| **分词方式** | 按语言规则分词（空格/标点分割），匹配整词。例如搜索 `"hello"` 不匹配 `"helloworld"` | 不分词，将整个 content 视为连续字符串做子串匹配。搜索 `"hello"` 可匹配 `"helloworld"` |
+| **大小写** | 文本索引默认不区分大小写（取决于索引的 `default_language`） | 手动 `.to_lowercase()` 转换 content，但 **query 原样保留**——若 query 含大写字母则不会命中（`"Hello".to_lowercase().contains("Hello")` 为 false） |
+| **停止词** | MongoDB 内置停止词表（英语默认约 127 个），搜索 `"the"` 可能零结果 | 无停止词概念，`"the"` 可匹配任何包含该子串的内容 |
+| **词干提取** | MongoDB 对英语等语言做 stemming（`"running"` → `"run"`），搜索 `"run"` 可匹配 `"running"` | 无词干提取，`"run"` 不匹配 `"running"` |
+| **排序** | 支持 `MessageSort::Relevance`，通过 `$meta: "textScore"` 按相关度排序；`Latest`/`Oldest` 按 `_id` 排序 | **未实现**，代码注释 `// FIXME: sorting, etc (will be required for tests)`，结果顺序不确定 |
+| **分页/限流** | 通过 `FindOptions::builder().limit(limit)` 在数据库层截断 | **未实现** limit，返回全部匹配结果 |
+
+**额外问题：query 的大小写陷阱**
+
+Reference 中 `content.to_lowercase().contains(query)` 只对 content 做了小写化，但 query 本身未做小写化。当用户传入 `query = "Hello"` 时：
+- `"hello world".to_lowercase().contains("Hello")` → `"hello world".contains("Hello")` → **false**
+
+而 MongoDB 的 `$text` 搜索不区分大小写，会正确匹配。这意味着 Reference 中对含大写字母的搜索词会产生假阴性。
+
+---
+
+#### 4.7.3 `fetch_messages` 的 pinned 过滤 Bug——逻辑完全反转
+
+**`MessageFilter` 字段注释**（[model.rs#L192](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/model.rs#L192)）：
+
+```rust
+/// Search for pinned
+pub pinned: Option<bool>,
+```
+
+注释含义：`pinned = Some(true)` 时应 **保留** 已置顶消息，`pinned = Some(false)` 时应保留未置顶消息。
+
+**MongoDB 实现**（[mongodb.rs#L58-L60](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/mongodb.rs#L58-L60)）：
+
+```rust
+if let Some(pinned) = query.filter.pinned {
+    filter.insert("pinned", pinned);
+};
+```
+
+MongoDB 的行为：将 `pinned: true` 或 `pinned: false` 作为等值查询条件插入 filter，**保留** 匹配的文档。符合注释语义。
+
+**Reference 实现**（[reference.rs#L61-L65](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L61-L65)）：
+
+```rust
+if let Some(pinned) = query.filter.pinned {
+    if message.pinned.unwrap_or_default() == pinned {
+        return false
+    }
+}
+```
+
+逻辑是：当 `message.pinned` 的值 **等于** `pinned` 参数时，**排除** 该消息（`return false`）。
+
+**逐值推演**：
+
+| `pinned` 参数 | `message.pinned` | `unwrap_or_default()` | `== pinned` | 结果 | 预期 |
+|---------------|------------------|-----------------------|-------------|------|------|
+| `Some(true)` | `Some(true)` | `true` | `true == true` = **true** | **排除** | 保留 ✅ |
+| `Some(true)` | `None` | `false` | `false == true` = false | 保留 | 排除 ✅ |
+| `Some(true)` | `Some(false)` | `false` | `false == true` = false | 保留 | 排除 ✅ |
+| `Some(false)` | `Some(false)` | `false` | `false == false` = **true** | **排除** | 保留 ✅ |
+| `Some(false)` | `Some(true)` | `true` | `true == false` = false | 保留 | 排除 ✅ |
+| `Some(false)` | `None` | `false` | `false == false` = **true** | **排除** | 保留 ✅ |
+
+**结论**：Reference 的 pinned 过滤逻辑 **完全反转**——它排除了应该保留的消息，保留了应该排除的消息。正确写法应为：
+
+```rust
+if message.pinned.unwrap_or_default() != pinned {
+    return false
+}
+```
+
+即：当消息的 pinned 状态与查询参数 **不等** 时才排除，**相等** 时保留。
+
+**影响范围**：此 Bug 使得以下场景全部行为异常：
+- `pinned=true` 查询会返回所有 **非置顶** 消息
+- `pinned=false` 查询会返回所有 **已置顶** 消息
+- 与 MongoDB 的行为完全相反
+
 ---
 
 ## 5. 架构模式总结
@@ -269,12 +463,14 @@ Reference 后端的核心定位是**测试替身**，而非生产替代品。证
 
 | 风险等级 | 问题 | 位置 |
 |----------|------|------|
+| 🔴 高 | `delete_messages` retain 条件误用 AND 替代 OR，批量删除会清空整个 messages HashMap | [reference.rs#L282-L289](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L282-L289) |
+| 🔴 高 | `fetch_messages` pinned 过滤逻辑完全反转，`pinned=true` 返回非置顶消息 | [reference.rs#L61-L65](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L61-L65) |
 | 🔴 高 | `delete_channel`/`delete_server` 级联删除差异导致 Reference 残留幽灵数据 | channels/ops/reference.rs、servers/ops/reference.rs |
 | 🔴 高 | `find_saved_messages_channel` 在 Reference 中用 user_id 做 HashMap key，与 MongoDB 语义不符 | channels/ops/reference.rs#L55-L61 |
 | 🔴 高 | `find_direct_messages` 在 Reference 中只匹配 Group，遗漏 DirectMessage 和 SavedMessages | channels/ops/reference.rs#L45-L52 |
+| 🟡 中 | `fetch_messages` 全文索引 vs 子串匹配：分词/词干/停止词/排序/分页全部不等价，且 query 未小写化导致假阴性 | [reference.rs#L51-L58](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L51-L58) vs [mongodb.rs#L45-L56](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/mongodb.rs#L45-L56) |
 | 🟡 中 | `fetch_channels` 在 Reference 中任一 ID 缺失即报错，MongoDB 宽容返回已有项 | channels/ops/reference.rs#L32-L42 |
 | 🟡 中 | `set_channel_role_permission` 在 Reference 中要求已有才能更新，MongoDB 幂等设置 | channels/ops/reference.rs#L85-L112 |
-| 🟡 中 | `fetch_messages` pinned 过滤逻辑在 Reference 中反转 | messages/ops/reference.rs#L62-L65 |
 | 🟡 中 | `insert_or_merge_member` 在 Reference 中不支持合并语义 | server_members/ops/reference.rs#L10-L19 |
 | 🟢 低 | `acknowledge_channels` 在 MongoDB 中丢弃 mentions，Reference 中保留 | channel_unreads/ops 对比 |
 | 🟢 低 | `set_relationship(None)` 分歧：Reference 额外处理了 `User` 变体 | users/ops/reference.rs#L120 |
