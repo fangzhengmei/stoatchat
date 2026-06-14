@@ -168,11 +168,11 @@ pub struct ReferenceDb {
 
 | 操作 | MongoDB 行为 | Reference 行为 |
 |------|-------------|---------------|
-| `delete_channel` | 删除 invites → unreads → webhooks → messages(含附件标记) → 从 server.channels 移除 → 附件标记 deleted → 删除 channel 本身 | 仅从 HashMap 中 `remove` channel，不清理任何关联数据 |
-| `delete_server` | 删除所有 messages(含附件标记) → emojis 标记 Detached → 删除 channels → 删除 unreads/invites → 删除 members/bans → 附件标记 deleted | 仅从 HashMap 中 `remove` server |
+| `delete_channel` | 删除 invites → unreads → webhooks → messages → 从 server.channels 移除 → 附件批量标记 deleted → 删除 channel 本身 | 仅从 HashMap 中 `remove` channel，不清理任何关联数据（消息、附件、邀请等全部残留） |
+| `delete_server` | 删除所有 messages → emojis 标记 Detached → 删除 channels → 删除 unreads/invites → 删除 members/bans → 附件批量标记 deleted | 仅从 HashMap 中 `remove` server |
 | `delete_role` | 从 server_members 的 roles 数组 `$pull` → 从 channels 的 role_permissions `$unset` → 从 server.roles `$unset` | 仅从 server.roles 中 `remove` |
 
-**后果**：Reference 后端删除频道后，消息、邀请、未读、Webhook 仍然残留在内存中；删除服务器后成员、封禁、频道等全部孤立。这些残留数据在 Reference 中还能被 fetch 到，产生"幽灵数据"。
+**后果**：Reference 后端删除频道后，消息、邀请、未读、Webhook 仍然残留在内存中；删除服务器后成员、封禁、频道等全部孤立。这些残留数据在 Reference 中还能被 fetch 到，产生"幽灵数据"。此外，Reference 的 `mark_attachments_as_deleted` 批量接口存在字段误用 Bug（详见 4.8 节），即便在有级联删除的路径上也无法正确标记附件删除状态。
 
 ### 4.2 查询语义：等价 vs 近似
 
@@ -421,6 +421,125 @@ if message.pinned.unwrap_or_default() != pinned {
 
 ---
 
+### 4.8 附件批量标删：reported 与 deleted 字段误用导致双重击穿
+
+**Bug 概述**：Reference 后端的 `mark_attachments_as_deleted`（批量版本）错误地将附件标记为 `reported=true`，而非 `deleted=true`，与 MongoDB 行为不一致，也与同名的单条版本（`mark_attachment_as_deleted`）不一致。
+
+---
+
+#### 4.8.1 代码证据
+
+**Trait 定义**（[ops.rs#L43-L44](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/files/ops.rs#L43-L44)）：
+
+```rust
+/// Mark multiple attachments as having been deleted.
+async fn mark_attachments_as_deleted(&self, ids: &[String]) -> Result<()>;
+```
+
+注释明确：语义是"标记为已删除"。
+
+**MongoDB 批量实现**（[mongodb.rs#L157-L174](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/files/ops/mongodb.rs#L157-L174)）：
+
+```rust
+async fn mark_attachments_as_deleted(&self, ids: &[String]) -> Result<()> {
+    self.col::<Document>(COL)
+        .update_many(
+            doc! { "_id": { "$in": ids } },
+            doc! { "$set": { "deleted": true } },
+        )
+        .await
+}
+```
+
+设置 `deleted: true`，与注释一致。
+
+**Reference 单条实现**（[reference.rs#L106-L114](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/files/ops/reference.rs#L106-L114)）：
+
+```rust
+async fn mark_attachment_as_deleted(&self, id: &str) -> Result<()> {
+    let mut files = self.files.lock().await;
+    if let Some(file) = files.get_mut(id) {
+        file.deleted = Some(true);
+        Ok(())
+    } else { ... }
+}
+```
+
+单条版本正确设置 `deleted = Some(true)`。
+
+**Reference 批量实现**（[reference.rs#L117-L133](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/files/ops/reference.rs#L117-L133)）：
+
+```rust
+async fn mark_attachments_as_deleted(&self, ids: &[String]) -> Result<()> {
+    let mut files = self.files.lock().await;
+    // ... 校验存在性 ...
+    for id in ids {
+        if let Some(file) = files.get_mut(id) {
+            file.reported = Some(true);  // ← Bug：应为 deleted
+        }
+    }
+    Ok(())
+}
+```
+
+批量版本设置 `reported = Some(true)`——明显是复制粘贴 `mark_attachment_as_reported` 时忘记改字段名。
+
+---
+
+#### 4.8.2 触发路径：两条调用链都会踩到
+
+调用 `mark_attachments_as_deleted` 批量接口的路径有两条：
+
+| 触发源 | 位置 | 场景 |
+|--------|------|------|
+| `Message::delete()` | [messages/model.rs#L1008](file:///d:/fz/0601-1\solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/model.rs#L1008) | 单条消息删除时，级联将附件标记为 deleted |
+| `prune_dangling_files` 定时任务 | [prune_dangling_files.rs#L30](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/daemons/crond/src/tasks/prune_dangling_files.rs#L30) | 扫描悬挂文件后，将超时的悬挂文件批量标删 |
+
+> 注意：`Message::bulk_delete`（消息批量删除）**不处理附件**，只删消息记录本身。这是另一处功能缺口，但不属于本 Bug 范畴。
+
+---
+
+#### 4.8.3 双重击穿：附件卡在生命周期夹缝
+
+`deleted` 和 `reported` 两个布尔字段共同决定了附件在清理系统中的可见性。Bug 导致附件被错误地放入 `reported` 状态而非 `deleted` 状态，从而在两道清理闸口前同时"隐身"。
+
+**第一道闸：已删除附件清理队列**
+
+`fetch_deleted_attachments` 的过滤条件（[reference.rs#L37-L49](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/files/ops/reference.rs#L37-L49)）：
+
+```rust
+file.deleted.is_some_and(|v| v) && !file.reported.is_some_and(|v| v)
+```
+
+即：**已删除且未被举报** 的附件才会进入清理队列。被误标的附件：`deleted = None, reported = Some(true)` → 不满足 → **击穿**。物理删除任务永远看不到这些附件。
+
+**第二道闸：悬挂文件检测**
+
+`fetch_dangling_files` 的过滤条件（[reference.rs#L52-L59](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/files/ops/reference.rs#L52-L59)）：
+
+```rust
+file.used_for.is_none() && !file.deleted.is_some_and(|v| v)
+```
+
+即：**未被使用且未被删除** 的附件才算 dangling。被误标的附件：`used_for = Some(Message{...}), deleted = None` → `used_for.is_none()` 不成立 → **击穿**。悬挂检测任务也看不到这些附件。
+
+**双重击穿的后果**：附件卡在 `reported=true + used_for=Some + deleted=false` 的中间状态——既不在删除队列里，也不在悬挂列表中，更不会被正常业务继续使用，成为永久"隐形"的孤儿记录。
+
+---
+
+#### 4.8.4 单条路径为何不受影响
+
+值得注意的是，单条 `mark_attachment_as_deleted` 是正确的。以下调用走单条路径，不受 Bug 影响：
+
+- 用户移除头像/背景：[edit_user.rs#L64](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/delta/src/routes/users/edit_user.rs#L64)
+- 服务器移除 banner/icon：[server_edit.rs#L118](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/delta/src/routes/servers/server_edit.rs#L118)、[#L124](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/delta/src/routes/servers/server_edit.rs#L124)
+- 角色移除 icon：[roles_edit.rs#L57](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/delta/src/routes/servers/roles_edit.rs#L57)
+- 频道移除 icon：[channel_edit.rs#L105](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/delta/src/routes/channels/channel_edit.rs#L105)
+
+这些场景都是单个附件，走单条接口，行为正确。只有**批量场景**（消息级联删除、悬挂文件定时清理）才会触发 Bug。
+
+---
+
 ## 5. 架构模式总结
 
 ### 5.1 职责分界三棱图
@@ -470,6 +589,7 @@ Reference 后端的核心定位是**测试替身**，而非生产替代品。证
 | 风险等级 | 问题 | 位置 |
 |----------|------|------|
 | 🔴 高 | `delete_messages` retain 条件误用 AND 替代 OR，导致目标频道消息全删、其他频道命中列表的消息被误删 | [reference.rs#L282-L289](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L282-L289) |
+| 🔴 高 | `mark_attachments_as_deleted` 批量版本误用 `reported` 字段替代 `deleted`，导致附件双重击穿、永久卡在生命周期夹缝 | [reference.rs#L117-L133](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/files/ops/reference.rs#L117-L133) |
 | 🔴 高 | `fetch_messages` pinned 过滤逻辑完全反转，`pinned=true` 返回非置顶消息 | [reference.rs#L61-L65](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L61-L65) |
 | 🔴 高 | `delete_channel`/`delete_server` 级联删除差异导致 Reference 残留幽灵数据 | channels/ops/reference.rs、servers/ops/reference.rs |
 | 🔴 高 | `find_saved_messages_channel` 在 Reference 中用 user_id 做 HashMap key，与 MongoDB 语义不符 | channels/ops/reference.rs#L55-L61 |
