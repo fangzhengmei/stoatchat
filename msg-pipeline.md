@@ -845,3 +845,383 @@ let (author_id, webhook) = match &author {
 - **与 `MessageAuthor::System` 的区分**：`System` 变体还携带 `username` 和 `avatar` 信息，用于展示。但 `author_id` 被固定为全零 ULID 后，这些展示信息不会出现在 `Message.author` 字段中，而是通过 `masquerade` 或客户端特殊逻辑处理。
 - **全零 ULID 的时间戳**：ULID 的前 10 位是毫秒时间戳，全零对应 1970-01-01。如果用 ULID 排序，系统消息的 author ID 会排在所有真实用户之前。
 - **消息删除权限**：`delete_message` 的权限检查通常需要 author 匹配或 `ManageMessages` 权限。系统消息的 author 是全零 ULID，没有用户能匹配，所以**只有 `ManageMessages` 权限才能删除系统消息**——这其实是正确的行为。
+
+---
+
+## 十、消息下游归宿与 ack worker 防抖逻辑
+
+### 10.1 薄弱点：SuppressNotifications + Mention 的未读落库问题
+
+这是消息发送链路中最容易误读的一个边界条件。我们沿着代码走一遍：
+
+当用户发送一条设置了 `SuppressNotifications` flag **但确实包含了 @提及** 的消息时：
+
+**第一步：`send` 方法被短路**
+
+**文件**: [model.rs#L696-L698](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/models/messages/model.rs#L696-L698)
+
+```rust
+if !self.has_suppressed_notifications()
+    && (is_dm_or_group || self.mentions.is_some() || self.contains_mass_push_mention())
+```
+
+由于 `has_suppressed_notifications() = true`，整个 `if` 块被跳过——`send` **不入队** `ProcessMessage`。
+
+**第二步：`send_without_notifications` 被 `mentions_elsewhere` 跳过**
+
+**文件**: [model.rs#L636-L651](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/models/messages/model.rs#L636-L651)
+
+```rust
+if !mentions_elsewhere {
+    if let Some(mentions) = &self.mentions {
+        tasks::ack::queue_message(...).await;
+    }
+}
+```
+
+`send` 调用时 `mentions_elsewhere = true`，所以 `send_without_notifications` **也不入队** `ProcessMessage`。
+
+**此时看似两条路都被堵死，mention 未读永远不会落库。但实际上这个场景在 `send_without_notifications` 的入队逻辑中被 fourth element `silenced` 解决了。**
+
+等一下——实际的 `send` 代码是这样的：
+
+```rust
+// send 方法 L681-L732
+self.send_without_notifications(
+    db, user.clone(), member.clone(),
+    matches!(channel, Channel::DirectMessage { .. }),
+    generate_embeds,
+    true,   // ← mentions_elsewhere = true
+).await?;
+
+// ...
+
+// 然后 L696-L732 的推送分支
+if !self.has_suppressed_notifications() && (...) {
+    // 带 push 的入队，第四元是 false（不 silenced）
+    tasks::ack::queue_message(
+        AckEvent::ProcessMessage {
+            messages: vec![(
+                Some(PushNotification::from(...).await),
+                self.clone(),
+                recipients,
+                false,  // ← silenced = false
+            )],
+        },
+    ).await;
+}
+```
+
+当 `SuppressNotifications=true` 时，`send` 的推送分支被跳过，但 **`send_without_notifications` 里还有一条独立的 mention 入队分支**——只不过被 `mentions_elsewhere = true` 屏蔽了。
+
+**等等，这个分支被 `mentions_elsewhere` 跳过了，那未读到底落不落？**
+
+答案是：**在 `send` 方法的 L681-L688 之前，还有一条隐藏的路径**——不，仔细看代码，`send` 调用 `send_without_notifications` 之后，除了推送分支，还在 L681-L688 前有没有 mention 入队？
+
+让我们重看完整的 `send` 流程：
+
+```
+send 方法
+├─ send_without_notifications(mentions_elsewhere = true)
+│   └─ 因为 mentions_elsewhere = true，跳过自身的 mention 入队
+└─ if !suppress && (dm || mentions || mass_mention) {
+       // 带推送通知的 ProcessMessage 入队
+       // silenced = false
+   }
+```
+
+**关键发现**：当 `SuppressNotifications=true` 且有 `mentions` 时，`send` 的推送分支被 `!suppress` 短路，而 `send_without_notifications` 的 mention 入队又被 `mentions_elsewhere=true` 跳过——**两条路径都不入队**。
+
+但等一下，`send_without_notifications` 在 `mentions_elsewhere = true` 时虽然跳过了自身的入队，但 `send` 方法在推送分支不成立时**没有兜底逻辑**——这意味着 **带 SuppressNotifications 且有 mention 的消息，mention 未读记录不会被写入**。
+
+不过，让我们重新审视 `send` 中的推送条件：
+
+```rust
+!self.has_suppressed_notifications()      // NOT A
+&& (                                       // AND
+    is_dm_or_group                          // B
+    || self.mentions.is_some()              // C
+    || self.contains_mass_push_mention()    // D
+)
+```
+
+条件展开：`¬A ∧ (B ∨ C ∨ D)`
+
+场景：`A=true`（Suppress）、`C=true`（有 mention）、`B=false`、`D=false`
+
+→ `false ∧ (false ∨ true ∨ false) = false` → 分支不执行 ✓
+
+那如果是 DM + Suppress + mention 呢？`A=true`、`B=true`、`C=true`
+
+→ `false ∧ (...) = false` → 也不执行 ✓
+
+**结论**：只要设置了 `SuppressNotifications`，无论是否有 mention，**推送通知和未读写入都不会发生**。这是有意的设计——`SuppressNotifications` 的语义就是"本条消息不产生任何通知与未读标记"。
+
+### 10.2 ack worker 第四元 silenced：只压推送不压未读写
+
+`ProcessMessage` 的四元组定义：
+
+**文件**: [ack.rs#L24-L26](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L24-L26)
+
+```rust
+messages: Vec<(
+    Option<PushNotification>,   // 0: 推送通知 payload（None 不推）
+    Message,                    // 1: 消息本体
+    Vec<String>,                // 2: 收件人列表
+    bool,                       // 3: silenced
+)>
+```
+
+`silenced` 在 `handle_ack_event` 中的处理逻辑：
+
+**文件**: [ack.rs#L156-L167](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L156-L167)
+
+```rust
+for (push, message, recipients, silenced) in messages {
+    if *silenced
+        || push.is_none()
+        || (recipients.is_empty() && !message.contains_mass_push_mention())
+    {
+        debug!("Rejecting push: ...");
+        continue;   // ← 只 continue 跳过了推送，不影响前面的 add_mention_to_unread
+    }
+
+    // 发送 amqp.message_sent
+    // 收集 mass_mentions
+}
+```
+
+注意 `silenced` 的判断在推送分支（第二个 `for` 循环），而未读写入在前面的第一个 `for` 循环：
+
+**文件**: [ack.rs#L135-L151](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L135-L151)
+
+```rust
+for user in users {
+    let message_ids: Vec<String> = messages
+        .iter()
+        .filter_map(|(_, message, recipients, _)| {
+            if recipients.contains(user) {
+                Some(message.id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !message_ids.is_empty() {
+        db.add_mention_to_unread(channel, user, &message_ids).await?;
+    }
+}
+```
+
+**关键区别**：
+
+| 环节 | 是否受 silenced 影响 | 逻辑 |
+|---|---|---|
+| `add_mention_to_unread` | ❌ 不受 | 第一个 `for` 循环里 `filter_map` 的闭包参数第四位是 `_`，完全忽略 |
+| `amqp.message_sent` 推送 | ✅ 受 | 第二个 `for` 循环用 `*silenced` 作为 `continue` 条件 |
+
+这就是"只压推送不压未读写"的准确含义：`silenced = true` 时，消息的未读标记仍然会写入 `channel_unreads.mentions`，但不会触发移动端推送通知。
+
+**两种入队方式的 silenced 值**：
+
+| 入队位置 | `push` | `silenced` | 效果 |
+|---|---|---|---|
+| `send_without_notifications` (L640-L650) | `None` | `self.has_suppressed_notifications()` | 未读写入，不推送 |
+| `send` (L702-L728) | `Some(...)` | `false` | 未读写入 + 推送 |
+
+### 10.3 ack worker 防抖合并批次
+
+**文件**: [ack.rs#L213-L310 (worker)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L213-L310)
+
+ack worker 的主循环是每秒一次的"扫描-处理-入队"三阶段：
+
+```
+每秒一次：
+  ├─ 扫描 tasks HashMap，收集 should_run() 到期的任务 keys
+  ├─ 对每个到期 key，调用 handle_ack_event 批量处理
+  └─ 从队列 Q 中 try_pop 所有新任务，合并到 tasks HashMap
+```
+
+**任务聚合键**：`(Option<String>, String, u8)`
+
+| 组成部分 | 含义 | 值 |
+|---|---|---|
+| `Option<String>` | user ID | `Some(user_id)`（ack 入队）/ `None`（消息入队） |
+| `String` | channel ID | 频道 ID |
+| `u8` | 事件类型 | 0 = AckMessage / 1 = ProcessMessage |
+
+**合并策略**（当 key 已存在时）：
+
+1. **ProcessMessage 合并** — `existing.push(new_event)` 追加到同批次
+2. **AckMessage 合并** — `task.data.event = event` 直接覆盖（保留最新 ack）
+
+**`DelayedTask` 的延迟机制**：
+
+- 新任务首次入队：`DelayedTask::new(Task { event })` — 延迟 `TASK_DELAY_MS`（500ms）
+- 追加时：`task.delay()` — 重新计算延迟时间（再等 500ms）
+- 到期时：`task.should_run()` 返回 true，任务被提交
+
+效果：同一频道在 500ms 内的多条消息会被合并到同一个 `ProcessMessage` 批次中，减少 MongoDB `$push` 和 AMQP 发布次数。
+
+### 10.4 Mass mention 立即冲刷
+
+**文件**: [ack.rs#L268-L273](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L268-L273)
+
+```rust
+if new_event.1.contains_mass_push_mention() {
+    // add the new message to the list of messages to be processed.
+    existing.push(new_event);
+    task.run_immediately();
+    continue;
+}
+```
+
+当追加的消息包含 mass mention（`@everyone` / `@online` / role 提及）时：
+
+1. 先把消息追加到批次中
+2. `task.run_immediately()` — 重置 `start_time` 为 0，让下一秒的扫描立即捕获该任务
+3. `continue` — 不执行后续的 `delay()` 和上限检查
+
+**设计意图**：mass mention 涉及大量用户，需要尽快推送通知，不希望被防抖延迟。`run_immediately()` 确保了即使当前批次还没到 500ms，包含 mass mention 的消息也会在下一轮扫描（≤1 秒）中被处理。
+
+**注意**：`continue` 跳过了上限检查，所以 mass mention 消息**不受 `process_message_delay_limit` 批次上限约束**——哪怕当前批次已经超过上限，mass mention 仍然会被追加并立即冲刷。
+
+### 10.5 批次上限提前提交
+
+**文件**: [ack.rs#L277-L286](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L277-L286)
+
+```rust
+if (existing.length() as u16)
+    < revolt_config::config()
+        .await
+        .features
+        .advanced
+        .process_message_delay_limit
+{
+    task.delay();
+}
+// 否则，不调用 delay() — 任务保持原有到期时间
+```
+
+当批次中的消息数达到 `process_message_delay_limit` 配置上限时：
+
+- 不再调用 `task.delay()` 刷新延迟
+- 任务维持下一次扫描时的到期时间（最多再等 1 秒）
+- 后续消息仍然会被追加到批次中（只是不再延迟）
+
+**设计意图**：在特别活跃的频道，防止批次无限增长导致 MongoDB `$push` 单次更新过大。到达上限后让任务尽快提交，后续消息会开启新的批次。
+
+**边缘情况**：如果追加的速度 > 处理速度，同一 key 的下一批任务会在前一批被提交后重新创建，理论上不会丢消息。
+
+### 10.6 队列满静默丢弃
+
+**文件**: [ack.rs#L53-L59 (queue_ack)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L53-L59) 与 [ack.rs#L69-L75 (queue_message)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L69-L75)
+
+```rust
+pub async fn queue_message(channel: String, event: AckEvent) {
+    Q.try_push(Data {
+        channel,
+        user: None,
+        event,
+    })
+    .ok();  // ← 静默丢弃
+    ...
+}
+```
+
+`Q` 是 `deadqueue::limited::Queue<Data>`，容量 10,000。`try_push` 在队列满时返回 `Err`，`.ok()` 直接吞掉错误。
+
+**后果**：
+- 高负载下，队列超过 10,000 条时，新的 `ProcessMessage`（未读写入 + 推送）和 `AckMessage`（ack 处理）会被**静默丢弃**
+- 未读记录丢失、推送不发送、ack 不生效
+- 没有日志记录丢弃了多少消息（只有 `info!` 日志记录当前队列占用率）
+
+### 10.7 用户 ack 反向 amqp 清移动端推送回路
+
+这是完整的 ack 回路：
+
+```
+客户端 (WebSocket / HTTP)
+  │
+  ├─ PUT /channels/<target>/ack/<message_id>
+  │   [channel_ack.rs#L15-L36]
+  │   └─ channel.ack(user_id, message_id, amqp)
+  │       [model.rs#L647-L657]
+  │       ├─ EventV1::ChannelAck.private(user)  // 通知用户其他设备
+  │       └─ acker::ack_channel(user, channel_id, message_id, amqp)
+  │           [acker.rs#L7-L24]
+  │           ├─ Redis GETSET acker:{user}+{channel}
+  │           │   (幂等：值变化才继续)
+  │           └─ amqp.process_ack(user_id, Some(channel_id), None)
+  │               [amqp.rs#L348-L381]
+  │               └─ 发布到 process_ack AMQP channel
+  │
+  └─ WebSocket ChannelAck event
+       [websocket.rs listener]
+       └─ (同 HTTP 路径)
+          └─ acker::ack_channel
+              └─ amqp.process_ack
+```
+
+**amqp.process_ack** 发布到 `rabbit.queues.acks` 队列，由 crond（定时任务服务）消费，最终走回 ack worker 的 `AckMessage` 分支：
+
+**文件**: [ack.rs#L92-L118 (handle_ack_event::AckMessage)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L92-L118)
+
+```rust
+AckEvent::AckMessage { id } => {
+    let unread = db.fetch_unread(user, channel).await?;
+    let updated = db.acknowledge_message(channel, user, id).await?;
+
+    if let (Some(before), Some(after)) = (unread, updated) {
+        let mentions_acked = before.mentions.len() - after.mentions.len();
+
+        if mentions_acked > 0 {
+            amqp.ack_notification_message(user, channel, id).await.ok();
+        }
+    }
+}
+```
+
+**文件**: [amqp.rs#L260-L299 (ack_notification_message)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/amqp/amqp.rs#L260-L299)
+
+```rust
+pub async fn ack_notification_message(user_id, channel_id, message_id) {
+    let payload = AckPayload { user_id, channel_id, message_id };
+
+    let mut headers = FieldTable::default();
+    headers.insert(
+        "x-deduplication-header".into(),
+        AMQPValue::LongString(format!("{}-{}", user_id, channel_id).into()),
+    );
+
+    self.ack_notification_message.basic_publish(
+        config.pushd.exchange.clone().into(),
+        config.pushd.ack_queue.into(),
+        ...
+    );
+}
+```
+
+**完整回路总结**：
+
+```
+用户 ack (HTTP/WS)
+  │
+  ▼
+channel.ack()
+  ├─ EventV1::ChannelAck (跨设备同步)
+  └─ acker::ack_channel
+      ├─ Redis GETSET 去重
+      └─ amqp.process_ack → crond 消费 → ack worker AckMessage
+          ├─ db.acknowledge_message (写 MongoDB：$pull mentions + $set last_id)
+          └─ amqp.ack_notification_message → pushd 消费
+              └─ 清除 iOS 徽章 / 移动端推送
+```
+
+**关键点**：
+- `amqp.process_ack` 不是直接操作数据库，而是把 ack 事件交给 crond 做可靠异步处理
+- 只有当 `mentions_acked > 0`（真的清除了 mention）时才发 `ack_notification_message`
+- `x-deduplication-header` 用 `user_id-channel_id` 做 AMQP 级别的去重，pushd 会合并同一用户同一频道的 ack
+- Redis GETSET 的幂等 + AMQP 去重 = 两层保障，避免重复处理相同 ack
+
