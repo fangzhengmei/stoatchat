@@ -222,6 +222,93 @@ permissions.restrict(0b0011); // 结果: 0b0011 — bit 2 和 3 被清零
 
 这就是为什么 Timeout 用 `restrict` 而不是 `revoke`——它需要把权限**封顶**到只保留 ViewChannel + ReadMessageHistory，而不是逐个收回不需要的权限。
 
+### 2.2 PermissionValue::has 的完整检查逻辑
+
+[has](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L50-L52) 是权限判断的最终执行者——所有"有没有某权限"的问题都归结到这个方法：
+
+```rust
+pub fn has(&self, v: u64) -> bool {
+    (self.0 & v) == v
+}
+```
+
+**关键：这是全位匹配，不是非零匹配。**
+
+`has` 要求参数 `v` 中的**每一个为 1 的位**在 `self.0` 中也必须为 1。这与简单的"有没有交集"（`(self.0 & v) != 0`）完全不同：
+
+```
+self.0 = 0b1101
+v      = 0b1001
+self.0 & v = 0b1001 == 0b1001 → true  ✓ 全部匹配
+
+self.0 = 0b1101
+v      = 0b1011
+self.0 & v = 0b1001 != 0b1011 → false ✗ bit 1 缺失
+```
+
+**单权限 vs 多权限检查**：
+
+```rust
+// 单权限检查：v 只有一位为 1，等价于"该位是否设置"
+permissions.has(ChannelPermission::ViewChannel as u64)
+// ViewChannel = 1 << 20 = 0x100000
+// 等价于: (permissions.0 & 0x100000) == 0x100000
+
+// 多权限检查：v 有多位为 1，要求所有位都设置
+permissions.has(ChannelPermission::ViewChannel as u64 + ChannelPermission::ReadMessageHistory as u64)
+// 要求同时拥有 ViewChannel 和 ReadMessageHistory
+// 等价于: (permissions.0 & (0x100000 | 0x200000)) == (0x100000 | 0x200000)
+```
+
+**has_user_permission 与 has_channel_permission 的类型安全封装**：
+
+```rust
+pub fn has_user_permission(&self, permission: UserPermission) -> bool {
+    self.has(permission as u64)  // UserPermission 是 repr(u32)，转 u64
+}
+
+pub fn has_channel_permission(&self, permission: ChannelPermission) -> bool {
+    self.has(permission as u64)  // ChannelPermission 是 repr(u64)
+}
+```
+
+这两个方法看似只是简单的类型转发，但它们解决了**位域语义问题**：
+
+| 调用方式 | 安全性 | 问题 |
+|---|---|---|
+| `has(Access as u64)` | ✅ 安全 | `Access` 是 `UserPermission` 的 bit 0，值为 1 |
+| `has(ManageChannel as u64)` | ⚠️ 语义不同 | `ManageChannel` 是 `ChannelPermission` 的 bit 0，值也为 1 |
+| `has_user_permission(Access)` | ✅ 语义正确 | 明确是 UserPermission 语义 |
+| `has_channel_permission(ManageChannel)` | ✅ 语义正确 | 明确是 ChannelPermission 语义 |
+
+`UserPermission::Access` 和 `ChannelPermission::ManageChannel` 的数值都是 `1`，但语义完全不同——一个是"用户间可访问"，另一个是"可管理频道"。`has_user_permission` / `has_channel_permission` 通过不同的参数类型强制调用方明确语义，避免混淆。
+
+**throw_if_lacking 系列方法**：
+
+[throw_if_lacking_user_permission](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L65-L73) 和 [throw_if_lacking_channel_permission](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L76-L84) 是 `has` 的断言版本：
+
+```rust
+pub fn throw_if_lacking_channel_permission(&self, permission: ChannelPermission) -> Result<()> {
+    if self.has_channel_permission(permission) {
+        Ok(())
+    } else {
+        Err(create_error!(MissingPermission { permission: permission.to_string() }))
+    }
+}
+```
+
+它们将布尔判断转化为 `Result<()>`，用于路由层的权限守卫——缺少权限时直接返回错误响应，避免手动 `if !has { return Err(...) }` 的样板代码。
+
+**has 在权限链路中的所有调用位置**：
+
+| 调用位置 | 代码 | 用途 |
+|---|---|---|
+| [impl.rs#L99](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L99) | `permissions.has_user_permission(UserPermission::SendMessage)` | DM 桥接：判断是否映射为完整 DM 权限 |
+| [impl.rs#L136](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L136) | `permissions.has_channel_permission(ChannelPermission::ViewChannel)` | ViewChannel 守卫：无此权限则清零 |
+| [mod.rs#L66](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L66) | `self.has_user_permission(permission)` | throw_if_lacking 内部 |
+| [mod.rs#L77](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L77) | `self.has_channel_permission(permission)` | throw_if_lacking 内部 |
+| [mod.rs#L103-L104](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L103-L104) | `self.has(!current_value.allows() & next_value.allows())` / `self.has(...)` | throw_permission_override 内部 |
+
 ---
 
 ## 三、全局权限计算——服务器层
@@ -1500,18 +1587,301 @@ Timeout 操作除了需要 `TimeoutMembers` 权限外，还有反向检查：如
 
 ---
 
-## 十五、关键代码索引
+## 十五、副作用函数的 panic 处理与类型安全守卫
+
+### 15.1 set_recipient_as_user 的 panic 机制
+
+[set_recipient_as_user](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs#L324-L341) 在 trait 定义中已明确标注了安全契约（[trait.rs#L67-L68](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/trait.rs#L67-L68)）：
+
+```rust
+/// Set the current user as the recipient of this channel
+/// (this will only ever be called for DirectMessage channels, use unimplemented!() for other code paths)
+async fn set_recipient_as_user(&mut self);
+```
+
+实现中的 panic 分支（[permissions.rs#L338](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs#L338)）：
+
+```rust
+async fn set_recipient_as_user(&mut self) {
+    if let Some(channel) = &self.channel {
+        match channel {
+            Cow::Borrowed(Channel::DirectMessage { recipients, .. })
+            | Cow::Owned(Channel::DirectMessage { recipients, .. }) => {
+                let recipient_id = recipients
+                    .iter()
+                    .find(|recipient| recipient != &&self.perspective.id)
+                    .expect("Missing recipient for DM");  // ← 第二个 panic 点
+
+                if let Ok(user) = self.database.fetch_user(recipient_id).await {
+                    self.user.replace(Cow::Owned(user));
+                }
+            }
+            _ => unimplemented!(),  // ← 第一个 panic 点：非 DM 频道类型
+        }
+    }
+}
+```
+
+**两层 panic**：
+
+| panic 点 | 触发条件 | 性质 |
+|---|---|---|
+| `unimplemented!()` | 频道类型不是 `DirectMessage` | 编译期宏，明确声明"此分支不应被执行" |
+| `expect("Missing recipient for DM")` | DM 频道的 recipients 中找不到非自己的用户 ID | 运行期断言，防御数据损坏 |
+
+**unimplemented!() 的设计意图**：
+
+`unimplemented!()` 是 Rust 的标准宏，在 debug 模式下 panic，在 release 模式下行为未定义（通常也会 panic）。它不是一个"优雅的错误处理"，而是一个**编译期文档 + 运行期安全网**：
+
+1. 代码审查时，`unimplemented!()` 明确表达"这个分支理论上不可达"
+2. 如果代码逻辑错误导致错误频道类型进入此路径，程序直接崩溃而不是静默产生错误权限值
+3. trait 文档注释与实现代码双重约束，形成契约
+
+**调用链安全**：`set_recipient_as_user` 只在 `calculate_channel_permissions` 的 `DirectMessage` 分支中被调用（[impl.rs#L96](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L96)），上游的 `get_channel_type()` 已保证只有 DM 频道才进入此分支。因此 `unimplemented!()` 在正常运行中不会触发。
+
+### 15.2 set_server_from_channel 的 panic 与缓存优化
+
+[set_server_from_channel](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs#L345-L375) 有相同的 panic 模式，但增加了缓存优化：
+
+```rust
+async fn set_server_from_channel(&mut self) {
+    if let Some(channel) = &self.channel {
+        match channel {
+            Cow::Borrowed(Channel::TextChannel { server, .. })
+            | Cow::Owned(Channel::TextChannel { server, .. }) => {
+                // 缓存优化：如果已有 server 且 ID 匹配，跳过数据库查询
+                if let Some(known_server) = /* self.server 的两种 Cow 变体匹配 */ {
+                    if server == &known_server.id {
+                        return;  // ← 提前返回，避免重复查询
+                    }
+                }
+
+                if let Ok(server) = self.database.fetch_server(server).await {
+                    self.server.replace(Cow::Owned(server));
+                }
+            }
+            _ => unimplemented!(),  // ← panic：非 TextChannel
+        }
+    }
+}
+```
+
+**与 set_recipient_as_user 的三个差异**：
+
+| 维度 | set_recipient_as_user | set_server_from_channel |
+|---|---|---|
+| 目标字段 | `self.user` | `self.server` |
+| 缓存检查 | ❌ 每次都查数据库 | ✅ 已有同 ID server 则跳过 |
+| panic 条件 | 非 DM + DM 无 recipient | 非 TextChannel |
+| 数据库失败 | 静默忽略（`if let Ok`） | 静默忽略（`if let Ok`） |
+
+**缓存优化的必要性**：`set_server_from_channel` 可能被多次调用（如在 `calculate_channel_permissions` 的 `ServerChannel` 分支中，后续的 `are_we_a_member` 也可能需要 server 数据）。而 `set_recipient_as_user` 只在 DM 桥接中调用一次，不需要缓存。
+
+### 15.3 两个副作用函数的共性风险
+
+**静默失败**：两个函数在数据库查询失败时都是 `if let Ok(...)` 静默忽略，不会 panic 也不会报错。这意味着：
+
+- `set_recipient_as_user` 失败 → `self.user` 保持 `None` → `calculate_user_permissions` 中的关系检查返回 `RelationshipStatus::None` → 权限值偏低（安全方向）
+- `set_server_from_channel` 失败 → `self.server` 保持 `None` → `are_we_server_owner` 返回 false → 权限值偏低（安全方向）
+
+**失败模式是安全方向**——数据库异常时，权限计算倾向于返回更少权限而非更多权限。这是一个有意的设计选择：宁可拒绝合法访问，也不要泄漏非法权限。
+
+**Builder 层面的 panic**：除了 trait 实现中的 panic，[calc_user](file:///d:/fz/0601-1\solo-dogfeeding\code\82-backend\crates\core\database\src\util\permissions.rs#L396-L409) 方法也有一个 panic：
+
+```rust
+pub async fn calc_user(mut self) -> DatabasePermissionQuery<'a> {
+    if self.cached_user_permission.is_some() {
+        return self;
+    }
+
+    if self.user.is_none() {
+        panic!("Expected `PermissionCalculator.user to exist.");  // ← 缺少 user 字段
+    }
+
+    DatabasePermissionQuery {
+        cached_user_permission: Some(calculate_user_permissions(&mut self).await),
+        ..self
+    }
+}
+```
+
+这个 panic 是开发期断言——如果调用方忘记通过 `.user(user)` 设置用户就调用 `calc_user()`，程序直接崩溃。
+
+---
+
+## 十六、Member::in_timeout 的时间戳失效机制
+
+### 16.1 实现代码
+
+[in_timeout](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/server_members/model.rs#L257-L263)：
+
+```rust
+pub fn in_timeout(&self) -> bool {
+    if let Some(timeout) = self.timeout {
+        *timeout > *Timestamp::now_utc()
+    } else {
+        false
+    }
+}
+```
+
+### 16.2 失效机制详解
+
+`Member.timeout` 的类型是 `Option<Timestamp>`，用 ISO 8601 时间戳表示 Timeout 的到期时间。
+
+**三种状态**：
+
+| timeout 字段 | in_timeout() 返回 | 含义 |
+|---|---|---|
+| `None` | `false` | 从未被 Timeout，或 Timeout 已被解除 |
+| `Some(未来时间)` | `true` | 正在被 Timeout，尚未到期 |
+| `Some(过去时间)` | `false` | Timeout 已到期，自动失效 |
+
+**自动失效的核心**：`*timeout > *Timestamp::now_utc()` 这个比较使得 Timeout 到期后**无需任何清理操作**即可自动失效。服务器不需要运行定时任务来解除过期的 Timeout——下次权限计算时，`in_timeout()` 自然返回 `false`。
+
+### 16.3 时间戳比较的精确语义
+
+`*timeout > *Timestamp::now_utc()` 使用了 `Timestamp` 的 `PartialOrd` 实现。这里有两个细节：
+
+**1. 严格大于（`>`）而非大于等于（`>=`）**
+
+如果 `timeout` 精确等于 `now_utc()`（Timeout 恰好在当前秒到期），`in_timeout()` 返回 `false`。这是"宁可早一秒释放也不多囚一秒"的设计。
+
+**2. 时间精度**
+
+`iso8601_timestamp::Timestamp` 的时间精度为纳秒级。在实际使用中：
+- API 层设置的 Timeout 通常以秒/分为单位
+- `now_utc()` 的精度取决于系统时钟
+- 由于是严格大于比较，在 Timeout 到期的同一纳秒内就可能从 `true` 跳变到 `false`
+
+### 16.4 Timeout 解除的两种方式
+
+| 方式 | 操作 | 效果 |
+|---|---|---|
+| 自然到期 | 不做任何操作 | `in_timeout()` 自动返回 `false` |
+| 手动解除 | 将 `timeout` 字段设为 `None`（通过 `member_edit` 路由） | `in_timeout()` 返回 `false` |
+
+手动解除时，`member_edit` 路由将 `timeout` 设为 `None` 并写入数据库，不是设为过去时间。这确保了：
+- 数据库中的 `timeout` 字段要么是 `None`（未 Timeout / 已解除），要么是未来的时间戳
+- 不存在 `timeout = 过去时间` 的"僵尸"状态（除非自然到期后尚未被覆盖更新）
+
+### 16.5 批量路径中的 in_timeout 调用
+
+批量路径的 [calculate_server_permissions](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs#L340-L342) 也直接调用 `member.in_timeout()`：
+
+```rust
+if member.in_timeout() {
+    permissions.restrict(*ALLOW_IN_TIMEOUT);
+}
+```
+
+与单用户路径的关键区别：
+- 单用户路径：通过 `are_we_timed_out()` trait 方法间接调用
+- 批量路径：直接调用 `member.in_timeout()`，无 trait 间接层
+
+两者执行相同的 `*timeout > *Timestamp::now_utc()` 比较，结果一致。
+
+---
+
+## 十七、are_we_timed_out 的双层关联——trait 抽象与实现
+
+### 17.1 第一层：PermissionQuery trait 定义
+
+[are_we_timed_out](file:///d:/fz/0601-1\solo-dogfeeding\code\82-backend\crates\core\permissions\src\trait.rs#L39-L40) 在 trait 中的声明：
+
+```rust
+/// Is our perspective user timed out on this server?
+async fn are_we_timed_out(&mut self) -> bool;
+```
+
+trait 只定义了接口签名和语义文档，不包含任何实现。它的存在使得 `calculate_server_permissions` 和 `calculate_channel_permissions` 可以泛型化——任何实现了 `PermissionQuery` 的类型都可以作为权限计算的数据源。
+
+**调用位置**：
+
+| 位置 | 代码 | 上下文 |
+|---|---|---|
+| [impl.rs#L73](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L73) | `query.are_we_timed_out().await` | 服务器级 Timeout 第一次 restrict |
+| [impl.rs#L132](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs#L132) | `query.are_we_timed_out().await` | 频道级 Timeout 第二次 restrict |
+
+两次调用使用的是**同一个 trait 方法**，但执行时间不同（频道级调用在 apply 频道覆盖之后），所以理论上两次调用的返回值可能不同（如果 `self.member` 在两次调用之间被修改）。但在当前实现中，`are_we_timed_out` 是只读操作，不会修改任何状态，因此两次调用结果始终相同。
+
+### 17.2 第二层：DatabasePermissionQuery 的具体实现
+
+[are_we_timed_out 实现](file:///d:/fz/0601-1\solo-dogfeeding\code\82-backend\crates\core\database\src\util\permissions.rs#L180-L186)：
+
+```rust
+async fn are_we_timed_out(&mut self) -> bool {
+    if let Some(member) = &self.member {
+        member.in_timeout()
+    } else {
+        false
+    }
+}
+```
+
+**双层关联图**：
+
+```
+calculate_server_permissions (泛型函数)
+  │
+  └─ query.are_we_timed_out().await    ← trait 方法调用
+       │
+       └─ DatabasePermissionQuery::are_we_timed_out  ← 具体实现
+            │
+            └─ member.in_timeout()      ← Member 模型方法
+                 │
+                 └─ *timeout > *Timestamp::now_utc()  ← 时间戳比较
+```
+
+**成员不存在的处理**：如果 `self.member` 为 `None`，`are_we_timed_out` 返回 `false`（不是 Timeout）。这在逻辑上是正确的——如果成员不存在，`calculate_server_permissions` 会在 `are_we_a_member` 检查处返回 0 权限，根本不会执行到 `are_we_timed_out`。
+
+**member 字段的 lazy 加载**：注意 `are_we_a_member`（[permissions.rs#L125-L142](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs#L125-L142)）在成员不存在时会自动从数据库补拉：
+
+```rust
+async fn are_we_a_member(&mut self) -> bool {
+    if let Some(server) = &self.server {
+        if self.member.is_some() {
+            true
+        } else if let Ok(member) = self
+            .database
+            .fetch_member(&server.id, &self.perspective.id)
+            .await
+        {
+            self.member = Some(Cow::Owned(member));  // ← 补拉后存入 self.member
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+```
+
+这意味着**在 `are_we_a_member` 返回 `true` 后，`self.member` 一定不为 `None`**。因此 `are_we_timed_out` 中的 `if let Some(member)` 检查在正常流程中总是 `Some`——`None` 分支只是一个防御性兜底。
+
+### 17.3 trait 抽象的测试价值
+
+`PermissionQuery` trait 使得权限计算逻辑可以在不连接数据库的情况下进行单元测试——只需实现一个 mock 的 `PermissionQuery`，硬编码所有方法的返回值。代码中确实有这种用法（[test.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/test.rs)）。
+
+但 `are_we_timed_out` 在测试中的 mock 有一个陷阱：由于它被调用了两次（服务器级 + 频道级），如果 mock 实现在两次调用之间改变返回值，会模拟一种现实中不可能出现的场景（成员的 Timeout 状态在纳秒级计算过程中发生变化）。测试设计时需要注意保持两次调用的一致性。
+
+---
+
+## 十八、关键代码索引
 
 | 职责 | 文件 |
 |---|---|
 | 权限位定义 | [channel.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/channel.rs) |
 | Override 结构 | [mod.rs (models)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs) |
-| PermissionValue 操作 | [mod.rs (models)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L14-L114) |
+| PermissionValue 操作（含 has） | [mod.rs (models)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L14-L114) |
 | throw_permission_override | [mod.rs (models)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/models/mod.rs#L92-L113) |
 | PermissionQuery trait | [trait.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/trait.rs) |
 | 权限计算核心逻辑（trait 版） | [impl.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/impl.rs) |
-| 数据库适配器（单用户） | [permissions.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs) |
+| 数据库适配器（单用户，含 set_recipient_as_user / set_server_from_channel / are_we_timed_out） | [permissions.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/permissions.rs) |
 | 批量权限计算（含同步版 calculate_server_permissions） | [bulk_permissions.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/util/bulk_permissions.rs) |
+| Member::in_timeout 时间戳失效 | [model.rs (members)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/server_members/model.rs#L257-L263) |
+| 成员 ranking | [model.rs (members)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/server_members/model.rs#L243-L254) |
 | 角色删除路由 | [roles_delete.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_delete.rs) |
 | 角色编辑路由（rank 互锁） | [roles_edit.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_edit.rs) |
 | 角色排序路由（rank 互锁） | [roles_edit_positions.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/roles_edit_positions.rs) |
@@ -1519,7 +1889,6 @@ Timeout 操作除了需要 `TimeoutMembers` 权限外，还有反向检查：如
 | 服务器角色权限设置 | [permissions_set.rs (server)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/servers/permissions_set.rs) |
 | 频道角色权限设置 | [permissions_set.rs (channel)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/delta/src/routes/channels/permissions_set.rs) |
 | 角色删除 DB 操作 | [mongodb.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/servers/ops/mongodb.rs#L113-L156) |
-| 成员 ranking | [model.rs (members)](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/models/server_members/model.rs#L243-L254) |
 | 语音权限同步 | [voice/mod.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/database/src/voice/mod.rs#L441-L466) |
 | 权限单元测试 | [test.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/permissions/src/test.rs) |
 | 服务器模型 | [servers.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/82-backend/crates/core/models/src/v0/servers.rs) |
