@@ -276,14 +276,20 @@ self.messages
 | C | "ch1" | "msgB" | 删除（两个条件都匹配） | 删除（channel 匹配 ∧ id 在 ids → 都不满足 → 不保留） | ✅ 一致 |
 | D | "ch2" | "msgA" | 保留（两个条件都不匹配） | 保留（channel 不匹配 ∧ id 不在 ids → 都满足 → 保留） | ✅ 一致 |
 
-**结论**：Reference 实现把 AND 误写为 AND（而非正确的 OR），导致除了"同时满足两个删除条件"的消息外，**所有其他消息也被错误删除**。正确写法应为：
+**结论**：Reference 实现把 AND 误写为 AND（而非正确的 OR），导致影响范围分为三段：
+
+1. **目标频道里的消息全被删**——无论是否出现在 ids 列表中。Case A（ch1, msgA）和 Case C（ch1, msgB）都无法被保留，因为 `channel != channel` 始终为 false，使得整个 AND 表达式为 false，消息全部被 retain 丢弃。
+2. **其他频道里命中 ids 列表的消息被误删**——Case B（ch2, msgB）中 `channel != channel` 为 true，但 `!ids.contains(id)` 为 false（因为 msgB 在列表中），AND 不满足，消息被错误删除。
+3. **其他频道里不命中 ids 列表的消息正常保留**——Case D（ch2, msgA）中两个子条件均为 true，AND 满足，消息被保留。
+
+正确写法应为：
 
 ```rust
 .retain(|id, message| message.channel != channel || !ids.contains(id));
 //                                             ^^          ^
 ```
 
-这是整个消息模块最严重的逻辑 Bug——任何一次批量删除都会清空整个 messages HashMap。
+这是整个消息模块最严重的逻辑 Bug——一次批量删除会连同目标频道的全部消息和其他频道中恰好 ID 匹配的消息一起清理掉。
 
 ---
 
@@ -463,7 +469,7 @@ Reference 后端的核心定位是**测试替身**，而非生产替代品。证
 
 | 风险等级 | 问题 | 位置 |
 |----------|------|------|
-| 🔴 高 | `delete_messages` retain 条件误用 AND 替代 OR，批量删除会清空整个 messages HashMap | [reference.rs#L282-L289](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L282-L289) |
+| 🔴 高 | `delete_messages` retain 条件误用 AND 替代 OR，导致目标频道消息全删、其他频道命中列表的消息被误删 | [reference.rs#L282-L289](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L282-L289) |
 | 🔴 高 | `fetch_messages` pinned 过滤逻辑完全反转，`pinned=true` 返回非置顶消息 | [reference.rs#L61-L65](file:///d:/fz/0601-1/solo-dogfeeding/code/89-backend/crates/core/database/src/models/messages/ops/reference.rs#L61-L65) |
 | 🔴 高 | `delete_channel`/`delete_server` 级联删除差异导致 Reference 残留幽灵数据 | channels/ops/reference.rs、servers/ops/reference.rs |
 | 🔴 高 | `find_saved_messages_channel` 在 Reference 中用 user_id 做 HashMap key，与 MongoDB 语义不符 | channels/ops/reference.rs#L55-L61 |
