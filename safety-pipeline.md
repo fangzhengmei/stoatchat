@@ -3,9 +3,11 @@
 ## 零、关键结论先列
 
 1. **RabbitMQ 与安全报告无直接关联**——AMQP 的 8 个通道全部用于推送通知（好友请求、消息通知、已读回执、DM 通话），安全报告不经过 RabbitMQ。
-2. **Redis Pub/Sub 是安全报告唯一的下游分发通道**——报告创建后通过 `EventV1::ReportCreate.global()` 发布到 Redis `"global"` 通道，由 bonfire 推送给在线客户端。
+2. **Redis `"global"` 通道实际上没有任何订阅者**——ReportCreate 通过 `global()` 发布到 Redis `"global"` 通道，但 bonfire 客户端从不订阅该通道。该通道在代码中只有发布逻辑，没有订阅逻辑，ReportCreate 事件发布后即被丢弃，没有实际消费者。
 3. **crond 守护任务与安全报告无任何关系**——4 个 crond 任务（file_deletion、prune_dangling_files、prune_members、acks）均不涉及安全报告的读写。
 4. **Rejected / Resolved 状态在当前仓库中没有任何写入代码**——`AbstractReport` trait 只有 `insert_report` 一个方法，不存在 `update_report` / `fetch_report` 等方法；delta 路由中没有管理后台 API；也没有 admin panel 相关代码。状态流转的设计责任归属于独立的管理后台服务（尚未实现）。
+5. **举报入库没有任何事务保障**——`report_content()` 中包含 4 类独立写入操作（附件标记、快照写入、报告写入、Redis 事件发布），彼此独立执行，无 MongoDB 事务包裹，无任何回滚机制。
+6. **失败时会产生多种孤儿数据**——附件可能被永久标记为 reported 但无对应报告、snapshots 可能存在但 report_id 指向不存在的报告、事件发布失败导致数据完整但通知丢失。
 
 ---
 
@@ -327,6 +329,368 @@ T+9ms     在线客户端收到 ReportCreate 事件
 
 ---
 
+## 七、bonfire 客户端订阅集合的初始化流程
+
+### 7.1 初始化时序
+
+```
+WebSocket 连接建立
+   │
+   ▼
+① 认证：User::from_token(db, token)  [websocket.rs:L92-L101]
+   │
+   ▼
+② State::from(user, session_id)      [state.rs:L77-L101]
+   │  ├─ 创建空 HashSet subscribed
+   │  ├─ subscribed.insert("{user_id}!")  ← 私有通道
+   │  └─ subscribed.insert(user_id)       ← 用户通道
+   │
+   ▼
+③ generate_ready_payload()           [impl.rs:L98-L332]
+   │
+   ├─ 3.1 加载用户数据（好友、服务器、频道、成员）
+   │
+   ├─ 3.2 self.reset_state().await    [state.rs:L159-L162]
+   │    ├─ state = SubscriptionStateChange::Reset
+   │    └─ subscribed.write().await.clear()  ← 清空！
+   │
+   ├─ 3.3 重新订阅（insert_subscription）：
+   │    ├─ private_topic ("{user_id}!")      [impl.rs:L289]
+   │    ├─ 所有关联用户的 user_id             [impl.rs:L291-L293]
+   │    │   （包括自己、好友、已接收/发送的好友请求）
+   │    ├─ 所有所在服务器的 server_id         [impl.rs:L295-L297]
+   │    ├─ Bot 额外订阅 "{server_id}u"       [impl.rs:L298-L300]
+   │    │   （服务器成员事件通道）
+   │    └─ 所有所在频道的 channel_id          [impl.rs:L303-L305]
+   │
+   └─ 3.4 返回 Ready 事件给客户端
+   │
+   ▼
+④ listener() 启动 [websocket.rs:L221-L403]
+   │
+   ├─ 首次循环调用 state.apply_state()
+   │   ├─ 检测到 SubscriptionStateChange::Reset
+   │   ├─ subscriber.unsubscribe_all().await
+   │   └─ 遍历 subscribed 集合，逐个 subscriber.subscribe(id).await
+   │      ← 此时 subscribed 中只有 3.3 中订阅的通道
+   │
+   └─ 进入 select! 循环等待消息
+
+**注意：全程没有任何地方插入 "global" 通道！**
+```
+
+### 7.2 订阅通道的完整列表
+
+| 通道命名 | 示例 | 订阅时机 | 用途 |
+|---------|------|---------|------|
+| `"{user_id}!"` | `"01J...!"` | 初始化 | 用户私有事件（私信、好友请求等） |
+| `"{user_id}"` | `"01J..."` | 初始化 + 动态 | 用户相关事件（被 @、状态变更等） |
+| `"{server_id}"` | `"ABC..."` | 初始化 + 动态 | 服务器全局事件（频道创建/删除等） |
+| `"{server_id}u"` | `"ABC...u"` | Bot 初始化 + 动态 | 服务器成员事件（仅 Bot 订阅） |
+| `"{channel_id}"` | `"XYZ..."` | 初始化 + 动态 | 频道事件（新消息、消息删除等） |
+| `"global"` | `"global"` | **永不订阅** | **全局广播通道，无任何客户端订阅** |
+
+### 7.3 动态订阅变更
+
+除了初始化订阅外，运行时还会根据事件动态调整：
+
+| 触发事件 | 订阅变更 | 代码位置 |
+|---------|---------|---------|
+| `ChannelCreate` | 订阅新频道 | [impl.rs:L464](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/impl.rs#L464) |
+| `ChannelDelete` | 取消订阅频道 | [impl.rs:L504](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/impl.rs#L504) |
+| `ChannelGroupJoin` | 订阅新群友的 user_id | [impl.rs:L508](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/impl.rs#L508) |
+| `ChannelGroupLeave` | 取消订阅（若不可访问） | [impl.rs:L513-L514](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/impl.rs#L513-L514) |
+| 服务器成员变更 | 重算服务器频道订阅 | [impl.rs:L335-L399](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/impl.rs#L335-L399) |
+| `ServerMemberLeave`（自己离开） | 重置并重新计算订阅 | [impl.rs:L630-L645](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/impl.rs#L630-L645) |
+| 服务器 15 分钟无活动 | `active_servers` LRU 过期，取消订阅 `{server_id}u` | [state.rs:L117-L134](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/state.rs#L117-L134) |
+
+### 7.4 订阅应用到 Redis 的时机
+
+[listener()](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/websocket.rs#L221-L403) 主循环的第一步就是 `state.apply_state().await`：
+
+- **Reset**：`unsubscribe_all()` 然后批量 `subscribe()` 所有 `subscribed` 集合中的通道
+- **Change { add, remove }**：逐个 `unsubscribe()` remove 列表，逐个 `subscribe()` add 列表
+- **None**：无操作
+
+`apply_state()` 在每次循环开始时执行，确保 Redis 订阅与本地 `subscribed` HashSet 保持一致。
+
+---
+
+## 八、ReportCreate 事件的实际消费者分析
+
+### 8.1 发布端代码
+
+[report_content.rs:L131](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/safety/report_content.rs#L131)：
+
+```rust
+EventV1::ReportCreate(report.into()).global().await;
+```
+
+[client.rs:L402-L404](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/events/client.rs#L402-L404)：
+
+```rust
+pub async fn global(self) {
+    self.p("global".to_string()).await;
+}
+```
+
+### 8.2 "global" 通道的搜索结果
+
+全局搜索 `"global"` 字符串（Rust 文件）：
+
+| 文件 | 行 | 用途 |
+|------|----|------|
+| `events/client.rs` | 403 | `self.p("global".to_string()).await;` —— **仅发布** |
+| **无其他文件** | — | **无任何订阅代码** |
+
+### 8.3 为什么没有订阅者？
+
+可能的设计意图推测：
+
+1. **管理后台应独立订阅**：`"global"` 通道本意是给管理后台服务订阅，管理员上线后通过管理后台的 WebSocket 接收新举报通知。但管理后台尚未实现。
+2. **误用了通道名**：`ReportCreate` 本应发布到某个管理员专用通道（如 `"admin_reports"`），但错误地使用了 `"global"`，而 `"global"` 通道从未被设计为客户端订阅的通道。
+3. **遗留代码**：早期版本中 `"global"` 通道可能有订阅者，后续重构中订阅逻辑被移除，但发布代码未清理。
+
+### 8.4 对安全报告流程的影响
+
+**ReportCreate 事件是死信**。发布到 Redis 后，由于没有任何订阅者，消息立即被丢弃。这意味着：
+
+- 管理员无法通过任何途径实时收到新举报通知
+- 新举报只能通过管理后台的定时轮询（如果有的话）或手动刷新发现
+- 但管理后台尚未实现，所以实际上新举报完全不可见
+
+> **对比**：`ChannelStartTyping` 等事件发布到 `"{channel_id}"` 通道，而该通道在客户端初始化时就被订阅，所以能正常推送。`ReportCreate` 是唯一使用 `global()` 方法的事件。
+
+### 8.5 其他使用 global() 的事件
+
+[client.rs:L260-L273](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/events/client.rs#L260-L273) 中 `EventV1` 的变体列表：
+
+```rust
+Auth(AuthifierEvent),
+Bulk { v: Vec<EventV1> },
+// ... 各种频道、服务器、用户事件 ...
+ReportCreate(Report),
+```
+
+检查 `EventV1` 的发布模式：只有 `ReportCreate` 使用 `global()`，其他事件要么使用 `private(id)`，要么使用 `server(id)`，要么使用 `p(channel)` 自定义通道。
+
+---
+
+## 九、事务边界与失败回滚机制
+
+### 9.1 举报入库的四个独立写入操作
+
+[report_content.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/delta/src/routes/safety/report_content.rs) 中的写入顺序：
+
+```
+④ 附件标记（循环，可能多次）
+   for file in files {
+       db.mark_attachment_as_reported(&file).await?;
+   }
+   └─ MongoDB: db.attachments.update_one({_id: id}, {$set: {reported: true}})
+
+⑥ 快照写入（循环，可能多次）
+   for content in snapshots {
+       let snapshot = Snapshot { ... report_id: id ... };
+       db.insert_snapshot(&snapshot).await?;
+   }
+   └─ MongoDB: db.safety_snapshots.insert_one(snapshot)
+
+⑦ 报告写入（一次）
+   let report = Report { id, ... status: Created {}, ... };
+   db.insert_report(&report).await?;
+   └─ MongoDB: db.safety_reports.insert_one(report)
+
+⑧ 事件发布（一次，无 ? 错误传播）
+   EventV1::ReportCreate(report.into()).global().await;
+   └─ Redis: PUBLISH "global" <event>
+```
+
+### 9.2 无事务证据
+
+全局搜索事务相关代码：
+
+| 搜索模式 | 结果 |
+|----------|------|
+| `start_session` | 仅在 `server_members/ops/mongodb.rs` 中出现，用于成员批量更新 |
+| `with_transaction` | 零命中 |
+| `transaction` | 仅在 `server_members` 中出现 |
+
+**结论**：`report_content()` 没有使用任何 MongoDB 事务。每个 `.await?` 都是独立的数据库操作。
+
+### 9.3 错误传播路径
+
+```
+db.mark_attachment_as_reported(&file).await?
+   ↓ 失败 → return Err(...)
+   ↓ 已成功的附件标记 **不会回滚**
+
+db.insert_snapshot(&snapshot).await?
+   ↓ 失败 → return Err(...)
+   ↓ 已成功的附件标记、已成功的快照写入 **不会回滚**
+
+db.insert_report(&report).await?
+   ↓ 失败 → return Err(...)
+   ↓ 已成功的附件标记、已成功的快照写入 **不会回滚**
+
+EventV1::ReportCreate(...).global().await
+   ↓ 失败 → 无 ? → 错误被静默忽略
+   ↓ 数据库数据完整，但事件丢失
+```
+
+### 9.4 与其他模块的对比
+
+唯一使用 MongoDB 事务的模块是 [server_members/ops/mongodb.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/server_members/ops/mongodb.rs)，用于：
+
+- 批量删除服务器成员
+- 同时更新多个集合（成员、频道、用户关系）
+
+这表明代码库**具备事务能力**，但安全报告模块**没有使用**。
+
+---
+
+## 十、孤儿数据场景分析
+
+### 10.1 场景 A：附件标记部分成功
+
+```
+files = ["A", "B", "C"]
+   │
+   ├─ mark_attachment_as_reported("A") → ✅ OK
+   │  attachments.A.reported = true
+   │
+   ├─ mark_attachment_as_reported("B") → ❌ 网络错误
+   │
+   └─ return Err(...)
+
+结果：
+  - attachments.A.reported = true ✅
+  - attachments.B.reported = false （未处理）
+  - attachments.C.reported = false （未处理）
+  - safety_snapshots 中无数据
+  - safety_reports 中无数据
+  - 事件未发布
+
+孤儿数据：
+  - attachments.A 被永久标记为 reported，但没有对应的 report
+  - 没有 report_id 可以追溯，管理员不知道这个附件为什么被标记
+```
+
+### 10.2 场景 B：附件全部成功，快照部分成功
+
+```
+snapshots = [S1, S2]   （例如举报用户并附带消息上下文）
+   │
+   ├─ mark_attachment_as_reported("A") → ✅
+   ├─ mark_attachment_as_reported("B") → ✅
+   │
+   ├─ insert_snapshot(S1) → ✅
+   │  safety_snapshots.S1 = { report_id: "R1", ... }
+   │
+   ├─ insert_snapshot(S2) → ❌ 网络错误
+   │
+   └─ return Err(...)
+
+结果：
+  - 2 个附件标记为 reported
+  - safety_snapshots.S1 已存在，report_id = "R1"
+  - safety_snapshots.S2 不存在
+  - safety_reports 中无数据 （report "R1" 尚未创建）
+
+孤儿数据：
+  - attachments 中的 2 个 reported 标记无对应 report
+  - safety_snapshots.S1 的 report_id = "R1" 指向不存在的报告
+  - S1 永远无法通过 report_id 查询到所属报告
+```
+
+### 10.3 场景 C：附件和快照全部成功，报告写入失败
+
+```
+   ├─ mark_attachment_as_reported 全部成功 ✅
+   ├─ insert_snapshot(S1) 成功 ✅
+   ├─ insert_snapshot(S2) 成功 ✅
+   │
+   ├─ insert_report(Report { id: "R1", ... }) → ❌ 网络错误
+   │
+   └─ return Err(...)
+
+结果：
+  - 2 个附件标记为 reported
+  - safety_snapshots.S1 存在，report_id = "R1"
+  - safety_snapshots.S2 存在，report_id = "R1"
+  - safety_reports 中无 "R1"
+
+孤儿数据：
+  - attachments 中的 reported 标记无对应 report
+  - safety_snapshots 中有 2 条孤儿快照，report_id 指向不存在的报告
+  - 这 2 条快照占用存储空间，但无法被任何查询使用
+```
+
+### 10.4 场景 D：数据库全部成功，Redis 发布失败
+
+```
+   ├─ mark_attachment_as_reported 全部成功 ✅
+   ├─ insert_snapshot 全部成功 ✅
+   ├─ insert_report 成功 ✅
+   │
+   ├─ EventV1::ReportCreate(...).global().await → ❌ Redis 连接失败
+   │  注意：这里没有 ?，错误被静默忽略
+   │
+   └─ return Ok(EmptyResponse)
+
+结果：
+  - 数据完整 ✅（附件、快照、报告都存在且一致）
+  - 事件未发布 ❌
+
+孤儿数据：
+  - 无数据库层面的孤儿数据
+  - 但管理后台（如果存在）不会收到实时通知
+  - 报告状态永远停留在 Created，无人处理
+```
+
+### 10.5 场景 E：所有操作成功，但 ReportCreate 无人订阅
+
+```
+   ├─ 所有数据库操作成功 ✅
+   ├─ Redis PUBLISH "global" event ✅
+   │  Redis 成功接收，但无任何客户端订阅 "global"
+   │  消息被 Redis 立即丢弃
+   │
+   └─ return Ok(EmptyResponse)
+
+结果：
+  - 数据完整 ✅
+  - 事件发布成功，但无人接收 ❌
+
+孤儿数据：
+  - 无数据库层面的孤儿数据
+  - 逻辑孤儿：报告存在但永远不会被处理
+  - 因为管理后台尚未实现，管理员看不到新举报
+```
+
+### 10.6 孤儿数据的清洗现状
+
+crond 有 `prune_dangling_files` 任务用于清理悬空附件，但：
+
+| 清理任务 | 能否清理安全报告孤儿数据 |
+|----------|-------------------------|
+| `file_deletion` | 否（仅删标记为 deleted 的文件） |
+| `prune_dangling_files` | 否（仅清理没有被任何 message/server/user 引用的附件） |
+| `prune_members` | 否（仅清理服务器成员） |
+
+**结论**：当前没有任何定时任务或机制清理安全报告产生的孤儿数据。这些数据会永久残留在数据库中，直到手动清理。
+
+### 10.7 修复建议
+
+| 问题 | 建议修复方案 |
+|------|-------------|
+| 无事务 | 使用 MongoDB 多文档事务包裹附件标记、快照写入、报告写入 |
+| 无回滚 | 事务失败时自动回滚所有写入 |
+| ReportCreate 死信 | 发布到管理员专用通道，并确保管理后台订阅该通道 |
+| 孤儿数据 | 新增 crond 任务定期清理：<br>1. 快照的 report_id 不存在于 reports → 删除快照<br>2. 附件 reported = true 但没有关联 report → 重置 reported |
+
+---
+
 ## 六、附录：代码引用索引
 
 | 组件 | 文件 | 关键行 |
@@ -341,8 +705,16 @@ T+9ms     在线客户端收到 ReportCreate 事件
 | EventV1 定义 | [client.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/events/client.rs) | L268 |
 | global() 发布 | [client.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/events/client.rs) | L402-L404 |
 | p() 底层 | [client.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/events/client.rs) | L368-L377 |
+| bonfire client 入口 | [websocket.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/websocket.rs) | L42-L195 |
 | bonfire listener | [websocket.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/websocket.rs) | L221-L403 |
+| State 初始化 | [state.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/state.rs) | L77-L101 |
+| State reset | [state.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/state.rs) | L159-L162 |
+| State 应用订阅 | [state.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/state.rs) | L104-L151 |
+| State insert_subscription | [state.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/state.rs) | L165-L185 |
+| generate_ready_payload | [impl.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/impl.rs) | L98-L332 |
 | 事件处理分支 | [impl.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/bonfire/src/events/impl.rs) | L434-L696 |
+| mark_attachment_as_reported | [files/ops/mongodb.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/files/ops/mongodb.rs) | L121-L136 |
+| MongoDB 事务使用示例 | [server_members/ops/mongodb.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/models/server_members/ops/mongodb.rs) | 事务相关 |
 | AMQP 8 通道 | [amqp.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/core/database/src/amqp/amqp.rs) | L18-L29 |
 | pushd 消费者 | [pushd/main.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/daemons/pushd/src/main.rs) | L28-L219 |
 | crond 任务 | [crond/main.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/90-backend/crates/daemons/crond/src/main.rs) | L10-L23 |
