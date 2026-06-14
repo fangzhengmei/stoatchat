@@ -1249,7 +1249,7 @@ pub async fn queue_message(channel: String, event: AckEvent) {
   │       └─ acker::ack_channel(user, channel_id, message_id, amqp)
   │           [acker.rs#L7-L24]
   │           ├─ Redis GETSET acker:{user}+{channel}
-  │           │   (幂等：值变化才继续)
+  │           │   (幂等：旧值为空 OR 旧值等于新值 → 推送 crond)
   │           └─ amqp.process_ack(user_id, Some(channel_id), None)
   │               [amqp.rs#L348-L381]
   │               └─ 发布到 rabbit.queues.acks 队列
@@ -1321,17 +1321,30 @@ pub async fn ack_notification_message(user_id, channel_id, message_id) {
 **完整正确回路总结**：
 
 ```
-用户 ack (HTTP/WS)
+频道级 ack (PUT /channels/<target>/ack/<message_id>)
   │
   ▼
-channel.ack() / server_ack()
-  ├─ EventV1::ChannelAck (跨设备同步)
-  └─ acker::ack_channel / acker::ack_server
+channel.ack()
+  ├─ EventV1::ChannelAck (无条件触发，跨设备同步)   ← 外层，无任何条件
+  └─ acker::ack_channel
       ├─ Redis GETSET 去重
-      └─ amqp.process_ack → crond 消费 (外部进程)
+      └─ if old.is_none() || old == new:
+             amqp.process_ack → crond 消费 (外部进程)
                                     ├─ db.acknowledge_message (写 MongoDB)
-                                    └─ amqp.ack_notification_message → pushd 消费
-                                                         └─ 清除 iOS 徽章 / 移动端推送
+                                    └─ amqp.ack_notification_message → pushd 消费 → 清移动端推送
+
+服务器级 ack (PUT /servers/<target>/ack)
+  │
+  ▼
+acker::ack_server
+  └─ for channel in channels:
+      ├─ calculate_channel_permissions (ViewChannel 校验)
+      ├─ if TextChannel:
+      │   ├─ Redis GETSET 去重
+      │   └─ if old.is_none() || old == new:
+      │          ├─ amqp.process_ack → crond 消费
+      │          └─ EventV1::ChannelAck (嵌入条件内触发，非对称)   ← 与频道级不对称
+      └─ else: unreachable!()
 ```
 
 **关键点**：
@@ -1345,38 +1358,210 @@ channel.ack() / server_ack()
 
 ---
 
-### 10.8 服务器级 ack 入口
+### 10.8 ack 入口四个深入分析点
 
-**文件**: [server_ack.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/delta/src/routes/servers/server_ack.rs)
+#### 10.8.1 幂等条件的字面意思：旧值为空或旧值等于新值
+
+**文件**: [acker.rs#L12-L21 (ack_channel)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L12-L21)
+**文件**: [acker.rs#L51-L62 (ack_server)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L51-L62)
+
+两个入口使用完全相同的幂等条件：
 
 ```rust
-#[put("/<target>/ack")]
-pub async fn ack(db, amqp, user, target) -> Result<EmptyResponse>
+let old: Option<String> = redis.getset(key, new_value).await?;
+
+if old.is_none() || old.unwrap() == new_value {
+    amqp.process_ack(...).await?;
+}
 ```
 
-处理逻辑在 [acker.rs#L26-L77 (ack_server)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L26-L77):
+逐字翻译条件：
+- `old.is_none()` — 该 user+channel 从未 ack 过（Redis 中无记录）
+- `old.unwrap() == new_value` — 上次 ack 的 message_id 与本次完全相同
 
-1. 遍历服务器所有频道列表
-2. 对每个频道检查 `ViewChannel` 权限
-3. 只处理 `TextChannel` 类型（`unreachable!()` 排除其他类型）
-4. 取 `channel.last_message_id` 作为 ack 目标消息 ID
-5. Redis `GETSET` 幂等去重
-6. 调用 `amqp.process_ack(user_id, Some(channel_id), Some(&server.id))`
-7. 发送 `EventV1::ChannelAck` 私有事件同步用户其他设备
+**直觉解读**：只有"首次 ack"或"重复 ack 同一个消息 ID"时才推送给 crond。
 
-与频道级 ack 的区别：
-- 服务器级 ack 每次传 `server_id` 参数（标识 ack 的上下文是服务器级）
-- 遍历所有频道，而不是单条消息
-- ack 目标是 `channel.last_message_id`，不是用户指定的 message_id
-- 只 ack `TextChannel`，DM/Group 等直接 `unreachable!()`
+**之前理解的偏差**：之前描述为"值变化才继续"——这恰好写反了。实际逻辑是**值相等（或不存在）**时推送，值**不相等**（真的 ack 了新消息）反而不推送。
 
-注意如果服务器包含非 TextChannel 时 `unreachable!()` 实际上可能 panic，理论上不会发生，因为服务器只包含 TextChannel 类型
+**为什么这样设计是对的**：
+- 首次 ack (`old=None`) → 需要处理 → 推送 ✓
+- 重复 ack 同一消息 (`old == new`) → 幂等保证，只处理一次 → 推送 ✓
+- ack 不同消息 (`old != new`) → 说明 Redis Key 已被覆盖或用户快速 ack → **不推送**
+
+最后一个分支 `old != new` 不推送的真实含义：Redis 的 GETSET 是原子操作，如果用户先 ack message-A，再快速 ack message-B，第二次 GETSET 时 `old=message-A, new=message-B`，此时不推送——message-A 的 ack 在第一次调用时已经推送过了，message-B 的 ack 需要下一次 `old=message-B, new=message-B` 才能触发。这实际上意味着**相邻两次 ack 不同消息时，第二次 ack 可能丢失**，需要等用户再次 ack 同一个 message-B 才能补上。
+
+**两种条件的对照表**：
+
+| 场景 | `old` | `new` | `old.is_none() \|\| old == new` | 是否推送 crond |
+|---|---|---|---|---|
+| 首次 ack | None | msg-1 | true | ✅ 推送 |
+| 重复 ack 同一消息 | Some(msg-1) | msg-1 | true | ✅ 推送（幂等允许） |
+| ack 新消息（紧跟上一次） | Some(msg-1) | msg-2 | false | ❌ 不推送 |
+| ack 新消息（等 Redis Key 过期后） | None | msg-2 | true | ✅ 推送 |
+| 重复 ack 已推过的新消息 | Some(msg-2) | msg-2 | true | ✅ 推送 |
 
 ---
 
-## 十一、本批更正汇总表
+#### 10.8.2 跨设备同步事件的对称性差异
 
-本次分析共更正 6 处之前的错误理解，对照源码验证如下：
+**频道级 ack**：`EventV1::ChannelAck` **无条件触发**
+
+**文件**: [model.rs#L646-L657 (Channel::ack)](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/models/channels/model.rs#L646-L657)
+
+```rust
+pub async fn ack(&self, user, message, amqp) -> Result<()> {
+    // 外层，无条件触发
+    EventV1::ChannelAck { id, user, message_id }
+        .private(user)
+        .await;
+
+    // 内层，有幂等条件才推送 crond
+    crate::util::acker::ack_channel(user, self.id(), message, amqp).await
+}
+```
+
+`EventV1::ChannelAck.private(user)` 在 **任何情况下**都会广播给该用户的所有在线设备，与 Redis 幂等条件完全独立。
+
+**服务器级 ack**：`EventV1::ChannelAck` **嵌入幂等条件内触发**
+
+**文件**: [acker.rs#L59-L70](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L59-L70)
+
+```rust
+if old.is_none() || old.unwrap() == channel_last_msg {
+    amqp.process_ack(&user.id, Some(channel_id), Some(&server.id))
+        .await
+        .to_internal_error()?;
+
+    // 与 amqp 同条件，不满足则完全跳过
+    EventV1::ChannelAck {
+        id: channel_id.to_string(),
+        user: user.id.clone(),
+        message_id: channel_last_msg,
+    }
+    .private(user.id.clone())
+    .await;
+}
+```
+
+**不对称性总结**：
+
+| 行为 | 频道级 ack | 服务器级 ack |
+|---|---|---|
+| `amqp.process_ack` | 幂等条件内 | 幂等条件内 |
+| `EventV1::ChannelAck` 跨设备同步 | **无条件**（外层） | **条件内**（与 amqp 绑定） |
+
+**实际后果**：当用户快速切换到新频道并 ack 新消息时（`old != new` 分支）：
+- 频道级 ack 的跨设备同步**仍然送达**——客户端会看到未读角标消失
+- 服务器级 ack 的跨设备同步**可能丢失**——客户端其他设备上该频道角标可能不更新
+
+---
+
+#### 10.8.3 服务器级 ack 的 N 次串行 IO 成本
+
+**文件**: [acker.rs#L31-L74](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L31-L74)
+
+`ack_server` 的主循环是纯串行 `for`：
+
+```rust
+let channels = db.fetch_channels(&server.channels).await?;   // 1 次批量查询
+let query = DatabasePermissionQuery::new(db, user).server(server);
+
+for channel in channels {
+    let channel_id = channel.id();
+    let mut q = query.clone().channel(&channel);
+
+    // ① 串行权限计算（每个频道可能多次 DB 查询）
+    if calculate_channel_permissions(&mut q)
+        .await
+        .has_channel_permission(ChannelPermission::ViewChannel)
+    {
+        // ② 模式匹配（同步）
+        let channel_last_msg = match &channel {
+            Channel::TextChannel { last_message_id, .. } => last_message_id,
+            _ => unreachable!(),
+        }.clone();
+
+        if let Some(channel_last_msg) = channel_last_msg {
+            // ③ 串行 Redis GETSET
+            let old = redis.getset(format!("acker:{}+{}", user.id, channel_id), ...).await?;
+
+            if old.is_none() || old.unwrap() == channel_last_msg {
+                // ④ 串行 AMQP 发布
+                amqp.process_ack(&user.id, Some(channel_id), Some(&server.id)).await?;
+
+                // ⑤ 串行 Redis PubSub
+                EventV1::ChannelAck { ... }.private(user.id.clone()).await;
+            }
+        }
+    }
+}
+```
+
+**单频道串行 IO 成本**（有 ViewChannel 权限 + 有消息）：
+1. `calculate_channel_permissions` — 权限查询（可能多次 MongoDB round-trip）
+2. `redis.getset` — 1 次 Redis round-trip
+3. `amqp.process_ack` — 1 次 AMQP publish（网络 IO）
+4. `EventV1::ChannelAck.private` — 1 次 Redis PubSub publish
+
+一个有 100 个频道的大服务器，在最坏情况下：
+- **100 × (权限查询 + Redis GETSET + AMQP + Redis PubSub) = 至少 300+ 次网络 round-trip**
+- 全部串行执行，无任何并发或批量处理
+- Redis 连接在函数开头获取一次，被复用，但每个频道仍然是独立的网络往返
+
+**优化空间**：
+- 可并行权限计算（`futures::join_all`）
+- 可批量 `GETSET`（Redis Pipeline / 事务）
+- 可批量 AMQP publish（但 AMQP 本身支持批投递）
+
+---
+
+#### 10.8.4 `unreachable!()` 挂在"频道集合只含 TextChannel"的不变量上
+
+**文件**: [acker.rs#L42-L47](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L42-L47)
+
+```rust
+let channel_last_msg = match &channel {
+    Channel::TextChannel {
+        last_message_id, ..
+    } => last_message_id,
+    _ => unreachable!(),
+}.clone();
+```
+
+代码的假设是：**服务器（`Server.channels`）中的频道列表只包含 `TextChannel` 类型**。
+
+**验证不变量的成立**：
+- 创建频道时，服务器内只允许创建 `TextChannel`
+- `db.fetch_channels(&server.channels)` 返回的是服务器频道集合
+- 因此所有 `channel` 都应该是 `TextChannel`
+- 其他频道类型（`DirectMessage` / `Group` / `SavedMessages` / `VoiceChannel`）只存在于用户私有上下文中，不会出现在 `Server.channels` 里
+
+**但这是一个脆弱的不变量**，风险在于：
+1. **未来新增服务器内频道类型**：如果引入 `AnnouncementChannel`、`ForumChannel`、`StageChannel` 等服务器专属类型，该 `match` 会走到 `_ => unreachable!()` 直接 panic
+2. **数据库脏数据**：如果通过迁移或手动修改将非 TextChannel 的 ID 写入 `Server.channels`，每次 ack_server 都会 panic
+3. **`fetch_channels` 的返回**：如果 `fetch_channels` 实现变更（如返回时做了类型过滤但过滤不完整），也会触发
+
+**更安全的替代写法**：
+
+```rust
+// 替代方案：跳过非 TextChannel，不 panic
+let channel_last_msg = match &channel {
+    Channel::TextChannel { last_message_id, .. } => last_message_id.clone(),
+    _ => continue,   // 或者返回错误提示
+};
+
+// 如果有 last_message_id 才继续
+let Some(channel_last_msg) = channel_last_msg else { continue };
+```
+
+这样未来支持新频道类型时不会崩溃，最多是未 ack 该新类型频道（如果新类型也需要消息 ack 的话再补分支即可）。
+
+
+---
+
+## 十一、本批更正汇总表（共 10 项）
+
+本次分析共更正 10 处之前的错误理解，对照源码验证如下：
 
 | # | 错误理解 | 正确结论 | 源码依据 |
 |---|---|---|---|
@@ -1386,6 +1571,10 @@ pub async fn ack(db, amqp, user, target) -> Result<EmptyResponse>
 | 4 | `AckMessage` 分支是活跃路径 | 本仓库中 `queue_ack` 无任何调用方，`AckMessage` 是**死代码** | 全局搜索 `queue_ack(` 仅 1 处定义 |
 | 5 | 只有频道级 ack 入口 | 还有服务器级 `ack_server`，遍历服务器所有可查看频道批量 ack，每个频道传 `server_id` 参数 | [acker.rs#L26-L77](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L26-L77)、[server_ack.rs](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/delta/src/routes/servers/server_ack.rs) |
 | 6 | mass mention 是下轮扫描 ≤500ms 处理 | mass mention 下轮扫描 ≤1 秒处理（worker 每秒扫描一次 + `run_immediately()`），且跳过批次上限检查 | [ack.rs#L268-L273](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/tasks/ack.rs#L268-L273) |
+| 7 | ack 幂等条件是"值变化才继续" | 实际是 **`old.is_none() \|\| old == new`**（旧值为空或旧值等于新值才推送），值变化 (`old != new`) 反而不推送；相邻两次 ack 不同消息时第二次可能丢失 | [acker.rs#L17](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L17)、[acker.rs#L59](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L59) |
+| 8 | 频道级与服务器级 ack 的跨设备同步行为对称 | **不对称**：频道级 `EventV1::ChannelAck` **无条件**在外层触发，服务器级 **嵌入幂等条件内**与 amqp 绑定触发 | [model.rs#L647-L657](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/models/channels/model.rs#L647-L657) vs [acker.rs#L59-L70](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L59-L70) |
+| 9 | 服务器级 ack 做批量 IO | 实际是 **纯串行 for 循环**，每频道依次做权限查询 + Redis GETSET + AMQP publish + Redis PubSub，100 频道的大服务器至少 300+ 次串行网络往返 | [acker.rs#L34-L74](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L34-L74) |
+| 10 | `unreachable!()` 是安全的断言 | 挂在"服务器频道集合只含 TextChannel"这一不变量上，一旦未来支持 `AnnouncementChannel` / `ForumChannel` 等新类型或数据库出现脏数据就会 panic | [acker.rs#L42-L47](file:///d:/fz/0601-1/solo-dogfeeding/code/81-backend/crates/core/database/src/util/acker.rs#L42-L47) |
 
 ### 关键架构设计总结
 
