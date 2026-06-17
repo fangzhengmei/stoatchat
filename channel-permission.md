@@ -319,3 +319,126 @@ self.revoke(v.deny);   // &= !
 - **频道角色**（按角色覆盖）
 
 如果需要针对特定成员调整频道权限，只能通过创建专属角色并设置频道角色覆盖来实现。
+
+---
+
+## 7. 批量成员可见性计算与单用户权限计算的差异对比
+
+除第 2 节描述的单用户路径外，代码库中还存在一条**批量权限计算路径**，用于一次性计算多名成员对某频道的可见性。两者在超时限制和语音发布/接收限制的实现上存在明显差异，本节结合代码逐一对比。
+
+### 7.1 批量路径的用途与入口
+
+批量计算的唯一调用方是推送守护进程 [mass_mention.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L112-L213)：当服务器频道发生 @everyone / @here 群体提及需要发推送时，用它快速筛出"能看到该频道"的成员，只给他们推通知。
+
+入口结构体：[BulkDatabasePermissionQuery](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L10-L25)
+
+对外只暴露一个布尔结果方法 [members_can_see_channel()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L28-L57)，内部调用私有函数 [calculate_members_permissions()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L186-L313)，最终只取 `ViewChannel` 这一位。
+
+### 7.2 批量路径执行流程
+
+[calculate_members_permissions()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L186-L313) 内部按以下顺序处理每个用户：
+
+1. **非成员短路**：`member.is_none()` → 0 权限
+2. **特权短路**：`user.privileged` → GrantAllSafe
+3. **服务器所有者短路**：`user.id == server.owner` → GrantAllSafe
+4. **计算服务器级权限**：调用批量版 [calculate_server_permissions(&server, user, member)](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L316-L345)
+5. **应用频道默认权限**：`permission.apply(channel_default_permissions)`
+6. **按角色 rank 叠加频道角色权限**：同单用户路径的 rank 降序 apply
+7. **（结束，无后续限制步骤）**
+
+### 7.3 差异一：超时（Timeout）限制
+
+这是两套路径最关键的差异。
+
+**单用户路径**——超时限制执行**两次**：
+
+| 位置 | 代码 | 说明 |
+|------|------|------|
+| 服务器级（[impl.rs#L73-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/permissions/src/impl.rs#L73-L75)） | `permissions.restrict(*ALLOW_IN_TIMEOUT)` | 第一次：在服务器角色 apply 之后 |
+| 频道级（[impl.rs#L132-L134](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/permissions/src/impl.rs#L132-L134)） | `permissions.restrict(*ALLOW_IN_TIMEOUT)` | 第二次：在频道默认+频道角色 apply 之后再执行一次 |
+
+第二次 restrict 的作用是**兜底**：即使频道默认权限或频道角色覆盖尝试给超时成员授予额外权限（如 SendMessage），也会被 restrict 清除，只保留 `ViewChannel | ReadMessageHistory`。
+
+**批量路径**——超时限制只执行**一次**：
+
+| 位置 | 代码 | 说明 |
+|------|------|------|
+| 服务器级（[bulk_permissions.rs#L340-L342](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L340-L342)） | `permissions.restrict(*ALLOW_IN_TIMEOUT)` | 仅此一次，在服务器角色 apply 之后 |
+| 频道级 | **缺失** | 频道默认权限和频道角色覆盖 apply 之后，没有再次 restrict |
+
+**影响**：在批量路径中，如果一个超时成员的频道角色覆盖授予了 `ViewChannel` 之外的权限（如 `SendMessage`），这些权限**不会被清除**，会保留在最终 `PermissionValue` 中。
+
+不过对可见性结果而言，`ALLOW_IN_TIMEOUT = ViewChannel | ReadMessageHistory` 已经保留了 `ViewChannel`，所以超时成员仍然"能看到"频道（只要服务器级或频道级没有显式 deny 掉 ViewChannel），可见性布尔值在多数场景下一致。差异主要体现在**存储的 PermissionValue 语义**上，而非可见性判定本身。
+
+### 7.4 差异二：语音发布/接收限制（can_publish / can_receive）
+
+**单用户路径**——完整实现了语音限制（[impl.rs#L64-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/permissions/src/impl.rs#L64-L71)）：
+
+```rust
+if !query.do_we_have_publish_overwrites().await {
+    permissions.revoke(ChannelPermission::Speak as u64);
+    permissions.revoke(ChannelPermission::Video as u64);
+}
+
+if !query.do_we_have_receive_overwrites().await {
+    permissions.revoke(ChannelPermission::Listen as u64);
+}
+```
+
+对应 `Member` 上的 `can_publish`、`can_receive` 布尔字段。`can_publish = false` 时撤销 Speak、Video；`can_receive = false` 时撤销 Listen。
+
+**批量路径**——**完全缺失**这两段逻辑。
+
+批量版 [calculate_server_permissions()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L316-L345) 的函数体中没有任何对 `can_publish` / `can_receive` 的引用，[calculate_members_permissions()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L186-L313) 中也没有补做。
+
+**影响**：批量路径计算出的 `PermissionValue` 中，Speak、Video、Listen 三项**不受** `can_publish` / `can_receive` 约束。但由于批量路径只取 `ViewChannel` 位做可见性判断，而 Speak/Video/Listen 与 ViewChannel 是不同位，因此这一差异**不影响可见性结果**，只影响存储的权限值语义。
+
+### 7.5 差异三：无 ViewChannel 时的 revoke_all
+
+**单用户路径**（[impl.rs#L136-L138](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/permissions/src/impl.rs#L136-L138)）：
+
+```rust
+if !permissions.has_channel_permission(ChannelPermission::ViewChannel) {
+    permissions.revoke_all();
+}
+```
+
+无 ViewChannel → 全部位清零，保证"看不到就什么都不给"。
+
+**批量路径**——不做 revoke_all。
+
+[members_can_see_channel()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L28-L57) 仅调用 `has_channel_permission(ViewChannel)` 取布尔值，即使无 ViewChannel 也不清零其它位。
+
+**影响**：对可见性判定无影响（只查 ViewChannel 位），但 `cached_member_perms` 中缓存的 PermissionValue 会保留多余的位，若未来复用该缓存做更细粒度的权限判断则可能产生偏差。
+
+### 7.6 差异四：遗留的 dead_code 方法
+
+[BulkDatabasePermissionQuery](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L10-L25) 上挂着三个 `#[allow(dead_code)]` 方法：
+
+| 方法 | 行 | 说明 |
+|------|----|------|
+| [get_default_channel_permissions()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L136-L153) | L136 | 未被调用，实际逻辑内联在 calculate_members_permissions 中 |
+| [get_channel_type()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L155-L167) | L155 | 标记 `dead_code, deprecated`，未被调用 |
+| [get_channel_role_overrides()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L170-L182) | L170 | 未被调用，实际逻辑内联 |
+
+这些方法看起来是早期设计时试图复用 `PermissionQuery` trait 的遗留物，后来批量路径改为直接内联逻辑，但方法未清理。它们不影响运行时行为，但会让阅读者误以为批量路径也走 trait 抽象。
+
+### 7.7 差异总结表
+
+| 维度 | 单用户路径（impl.rs） | 批量路径（bulk_permissions.rs） | 对可见性结果的影响 |
+|------|----------------------|-------------------------------|-------------------|
+| 超时 restrict 次数 | 2 次（服务器级 + 频道级） | 1 次（仅服务器级） | 通常无影响（ViewChannel 已被保留） |
+| can_publish 撤销 Speak/Video | 有 | **无** | 无影响（非 ViewChannel 位） |
+| can_receive 撤销 Listen | 有 | **无** | 无影响（非 ViewChannel 位） |
+| 无 ViewChannel → revoke_all | 有 | **无** | 无影响（仅查 ViewChannel 位） |
+| 特权/所有者短路 | 有 | 有（等价） | 无 |
+| 非成员 → 0 | 有 | 有（等价） | 无 |
+| 角色排序 | rank 降序 apply | rank 降序 apply（等价） | 无 |
+
+### 7.8 结论
+
+批量路径是单用户路径的**简化版**：它省略了所有与 `ViewChannel` 无关的限制步骤（语音限制、频道级超时兜底、revoke_all），因为其唯一用途是判定可见性。在当前仅调用 `members_can_see_channel()` 的场景下，这些省略不会导致可见性误判。
+
+但需要注意两点风险：
+1. **语义不一致**：同一个超时成员，经单用户路径和批量路径算出的 `PermissionValue` 可能不同（批量路径多出 Speak/Video/Listen 等位）。
+2. **复用风险**：若未来直接复用 `cached_member_perms` 做更细粒度判断（如能否发言），会因缺少语音限制和频道级超时兜底而产生越权。
