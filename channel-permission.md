@@ -442,3 +442,226 @@ if !permissions.has_channel_permission(ChannelPermission::ViewChannel) {
 但需要注意两点风险：
 1. **语义不一致**：同一个超时成员，经单用户路径和批量路径算出的 `PermissionValue` 可能不同（批量路径多出 Speak/Video/Listen 等位）。
 2. **复用风险**：若未来直接复用 `cached_member_perms` 做更细粒度判断（如能否发言），会因缺少语音限制和频道级超时兜底而产生越权。
+
+---
+
+## 8. 成员可见性计算的所有业务场景
+
+成员可见性判定（"某成员能否看到某频道"）贯穿于后端多个子系统，每条路径使用的计算方式、过滤时机和目的各不相同。本节按业务场景逐一拆解。
+
+### 8.1 场景总览
+
+| 场景 | 使用路径 | 入口模块 | 核心目的 |
+|------|---------|----------|---------|
+| 发送消息时过滤 @提及目标 | 批量路径 | delta/routes/channels → Message::create_from_api | 防止用户在隐藏频道中 @ 看不到该频道的成员 |
+| @everyone/@role 群体推送通知 | 批量路径 | pushd/consumers/inbound/mass_mention | 只给能看到频道的成员推送离线通知 |
+| 拉取服务器详情时过滤频道列表 | 单用户路径 | delta/routes/servers/server_fetch | 返回给客户端的频道列表只包含可见频道 |
+| WebSocket Ready 时过滤频道订阅 | 单用户路径 | bonfire/events/impl (filter_accessible_channels) | 只订阅用户可见的频道事件主题 |
+| 权限变更时重新计算订阅 | 单用户路径 | bonfire/events/impl (recalculate_server) | 权限变化后自动订阅/退订对应频道 |
+
+### 8.2 场景一：发送消息时过滤 @提及目标
+
+这是批量可见性计算除推送外的**另一个重要调用方**，但经常被忽略。
+
+入口位置：[Message::create_from_api()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/models/messages/model.rs#L491-L534)
+
+当消息内容包含用户提及（`@某成员`）时，在 `TextChannel` 场景下会经历**两级过滤**：
+
+#### 第一级：服务器成员身份过滤
+
+```rust
+let valid_members = db.fetch_members(server.as_str(), &mentions_vec[..]).await;
+if let Ok(valid_members) = valid_members {
+    let valid_mentions = HashSet::<&String, RandomState>::from_iter(
+        valid_members.iter().map(|m| &m.id.user),
+    );
+    user_mentions.retain(|m| valid_mentions.contains(m));
+```
+
+先把所有不是该服务器成员的被提及用户剔除。比如 A 服务器成员 @ 了 B 服务器的成员，这一级就把 B 过滤掉。
+
+#### 第二级：频道可见性过滤
+
+```rust
+if !user_mentions.is_empty() {
+    let member_channel_view_perms =
+        BulkDatabasePermissionQuery::from_server_id(db, server)
+            .await
+            .channel(&channel)
+            .members(&valid_members)
+            .members_can_see_channel()
+            .await;
+
+    user_mentions
+        .retain(|m| *member_channel_view_perms.get(m).unwrap_or(&false));
+}
+```
+
+调用批量路径 [members_can_see_channel()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L28-L57)，对所有剩余的被提及成员一次性计算"能否看到当前频道"。不能看到的，从 `user_mentions` 集合中移除，最终消息的 `mentions` 字段只保留能看到该频道的用户 ID。
+
+#### 业务目的
+
+- **防止信息泄露**：如果在私有频道中 @ 了一个看不到该频道的成员，该成员不应出现在消息的 `mentions` 列表中，也不会收到未读提醒和推送通知。
+- **未读计数准确**：只有能看到频道的成员才会有未读计数增加。
+
+#### 单元测试验证
+
+该逻辑在 [message_send.rs 的 message_mention_constraints 测试](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/delta/src/routes/channels/message_send.rs#L208-L403) 中被完整覆盖了三种情况：
+1. 被提及者不是服务器成员 → 被过滤
+2. 被提及者是服务器成员但频道不可见 → 被过滤
+3. 被提及者拥有能看到频道的角色 → 保留
+
+测试断言三次发送的 `message.mentions` 字段分别为空、空、非空。
+
+### 8.3 场景二：@everyone/@role 群体推送通知
+
+入口位置：[pushd/mass_mention.rs::consume()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L95-L245)
+
+当消息标记了 `MentionsEveryone` 或包含角色提及时，pushd 消费该事件，按成员批量发送推送通知。此场景下**只有角色提及路径使用了可见性过滤**，`@everyone` 路径则未过滤。
+
+#### 分支 A：@everyone —— 不做可见性过滤
+
+```rust
+if flags.has(MessageFlags::MentionsEveryone) {
+    let mut db_query = self.db.fetch_all_members_chunked(&payload.server_id).await?;
+    loop {
+        // 分块拉取成员
+        // ...
+        // 直接给所有人加未读，不检查可见性
+        self.db.add_mention_to_many_unreads(push.channel.id(), &userids, &ack_chnl).await;
+        // 再过滤掉在线用户和已有提及，剩余的发推送
+        self.fire_notification_for_users(&push, &target_users).await?;
+    }
+}
+```
+
+注意此处调用了 `add_mention_to_many_unreads` 但**没有调用 `members_can_see_channel()`**。这意味着在 @everyone 场景下，即使成员看不到该频道，也会被加上未读计数并可能收到推送（推送环节只做了在线过滤）。这是一个已知的设计特性。
+
+#### 分支 B：@role —— 使用可见性过滤
+
+```rust
+} else if let Some(roles) = &push.message.role_mentions {
+    let mut role_members = self.db.fetch_all_members_with_roles_chunked(&payload.server_id, roles).await?;
+    while !exhausted {
+        // 分块拉取有该角色的成员
+        let mut q = query.clone().members(&chunk);
+        let viewing_members: Vec<String> = q
+            .members_can_see_channel()
+            .await
+            .iter()
+            .filter_map(|(uid, viewable)| {
+                if *viewable && !existing_mentions.contains(uid) {
+                    Some(uid.clone())
+                } else { None }
+            })
+            .collect();
+        // 再过滤掉在线用户，剩余的发推送
+        self.fire_notification_for_users(&push, &targets).await?;
+    }
+}
+```
+
+角色提及路径调用了批量可见性计算 [members_can_see_channel()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L28-L57)，只有既拥有该角色、又能看到频道、且不在线、且未被单独 @ 过的成员才会收到推送通知。
+
+### 8.4 场景三：拉取服务器详情时过滤频道列表
+
+入口位置：[server_fetch.rs::fetch()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/delta/src/routes/servers/server_fetch.rs#L27-L39)
+
+当客户端请求服务器详情并带上 `include_channels=true` 参数时，服务端需要返回该用户可见的所有频道。
+
+```rust
+let all_channels = db.fetch_channels(&server.channels).await?;
+let mut visible_channels: Vec<v0::Channel> = vec![];
+
+for channel in all_channels {
+    let mut channel_query = query.clone().channel(&channel);
+    if calculate_channel_permissions(&mut channel_query)
+        .await
+        .has_channel_permission(ChannelPermission::ViewChannel)
+    {
+        visible_channels.push(channel.into());
+    }
+}
+```
+
+**使用单用户路径** [calculate_channel_permissions()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/permissions/src/impl.rs#L81-L147)，对每个频道单独计算一次完整权限，然后检查 `ViewChannel` 位。
+
+由于这里是单用户视角且频道数量通常远小于成员数量（一个服务器最多几十上百个频道），使用完整的单用户路径是合理的——不需要批量优化，且完整路径确保了超时、语音限制、revoke_all 等全部约束都被正确应用。
+
+### 8.5 场景四：WebSocket Ready 时过滤频道订阅
+
+入口位置：[bonfire/events/impl.rs::generate_ready_payload()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/bonfire/src/events/impl.rs#L140-L145)
+
+用户连接 WebSocket、发送认证后，服务端返回 Ready 事件，其中包含所有可见频道的列表以及订阅对应事件主题。
+
+```rust
+let mut channels = db.find_direct_messages(&user.id).await?;
+channels.append(&mut db.fetch_channels(&channel_ids).await?);
+
+// Filter server channels by permission.
+let channels = self.cache.filter_accessible_channels(db, channels).await;
+```
+
+内部调用 [Cache::filter_accessible_channels()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/bonfire/src/events/impl.rs#L49-L62)，再逐个调用 [Cache::can_view_channel()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/bonfire/src/events/impl.rs#L21-L46)。
+
+`can_view_channel()` 本质上也是单用户路径的封装：
+
+```rust
+let mut query = DatabasePermissionQuery::new(db, self.users.get(&self.user_id).unwrap())
+    .channel(channel);
+// ...
+calculate_channel_permissions(&mut query)
+    .await
+    .has_channel_permission(ChannelPermission::ViewChannel)
+```
+
+对非 TextChannel 类型（DM、Group、SavedMessages）直接返回 `true`，因为这些频道的成员集合本身就是白名单，不需要额外权限判断。
+
+### 8.6 场景五：权限变更时重新计算订阅
+
+入口位置：[bonfire/events/impl.rs::recalculate_server()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/bonfire/src/events/impl.rs#L335-L399)
+
+当服务器或频道的权限配置发生变更时（服务器默认权限修改、角色权限修改、频道默认权限修改、频道角色覆盖修改、成员角色变更等），bonfire 会重新计算该服务器下所有频道对当前用户的可见性，并动态订阅/退订对应频道的事件主题。
+
+触发来源分布在 [handle_incoming_event_v1()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/bonfire/src/events/impl.rs#L434-L684) 中，会设置 `queue_server` 标记的事件包括：
+
+| 事件 | 触发条件 |
+|------|---------|
+| `EventV1::ServerUpdate` | `data.default_permissions.is_some()` |
+| `EventV1::ServerRoleUpdate` | `data.rank.is_some() \|\| data.permissions.is_some()` |
+| `EventV1::ServerMemberUpdate` | `data.roles.is_some() \|\| data.timeout.is_some()` |
+| `EventV1::ChannelUpdate` | 对 TextChannel 始终触发 |
+
+`recalculate_server()` 的核心逻辑：
+
+```rust
+for (channel_id, channel) in &self.cache.channels {
+    if channel.server() == Some(id) {
+        if self.cache.can_view_channel(db, channel).await {
+            added_channels.push(channel_id.clone());
+        } else {
+            removed_channels.push(channel_id.clone());
+        }
+    }
+}
+```
+
+对缓存中属于该服务器的每个频道，调用单用户路径的 `can_view_channel()`，然后对比变化：
+- 从不可见变为可见 → 订阅该频道的事件主题，并向客户端发送 `ChannelCreate` 事件
+- 从可见变为不可见 → 退订该频道的事件主题，并向客户端发送 `ChannelDelete` 事件
+
+这保证了客户端实时感知权限变更对频道可见性的影响，不需要刷新页面。
+
+### 8.7 两条路径的选择策略总结
+
+代码库在不同场景下选择批量路径还是单用户路径，遵循以下原则：
+
+| 原则 | 批量路径 | 单用户路径 |
+|------|---------|-----------|
+| **适用场景** | N 个成员 × 1 个频道 | 1 个用户 × N 个频道 |
+| **性能优势** | 一次数据库查询批量拉取成员、角色、权限，避免 N 次往返 | 完整权限语义准确，适合需要精确判断多种权限位的场景 |
+| **语义完整性** | 省略了语音限制、频道级超时兜底、revoke_all（见第 7 节） | 所有限制步骤完整执行 |
+| **调用方** | Message::create_from_api（过滤 @提及）、pushd/mass_mention（角色提及推送） | server_fetch（频道列表）、bonfire Ready、bonfire 权限重算 |
+
+选择批量路径的两个场景都只需要判断 `ViewChannel` 这一位，因此省略的限制步骤不影响结果正确性。若未来有场景需要批量判断 `SendMessage`、`Speak` 等更细粒度权限，则不能直接复用当前批量路径，需要补齐缺失的限制步骤。
+
