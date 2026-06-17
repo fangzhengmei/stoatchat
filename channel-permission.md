@@ -328,7 +328,13 @@ self.revoke(v.deny);   // &= !
 
 ### 7.1 批量路径的用途与入口
 
-批量计算的唯一调用方是推送守护进程 [mass_mention.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L112-L213)：当服务器频道发生 @everyone / @here 群体提及需要发推送时，用它快速筛出"能看到该频道"的成员，只给他们推通知。
+批量路径有**两个实际调用场景**，其中一个场景内部又分为两条分支，仅其中一条分支使用了可见性过滤：
+
+| 调用方 | 场景 | 是否使用 members_can_see_channel() 做可见性过滤 |
+|--------|------|----------------------------------------------|
+| [Message::create_from_api()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/models/messages/model.rs#L514-L520) | 发送消息时过滤 @提及目标（第二级过滤） | **是**，对所有被提及用户统一过滤 |
+| [pushd/mass_mention.rs @everyone 分支](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L135-L188) | @everyone 全员推送通知 | **否**，直接对全服务器成员推送，不调用可见性过滤 |
+| [pushd/mass_mention.rs @role 分支](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L189-L240) | @role 角色提及推送通知 | **是**，只给能看到频道的角色成员推送 |
 
 入口结构体：[BulkDatabasePermissionQuery](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L10-L25)
 
@@ -451,13 +457,14 @@ if !permissions.has_channel_permission(ChannelPermission::ViewChannel) {
 
 ### 8.1 场景总览
 
-| 场景 | 使用路径 | 入口模块 | 核心目的 |
-|------|---------|----------|---------|
-| 发送消息时过滤 @提及目标 | 批量路径 | delta/routes/channels → Message::create_from_api | 防止用户在隐藏频道中 @ 看不到该频道的成员 |
-| @everyone/@role 群体推送通知 | 批量路径 | pushd/consumers/inbound/mass_mention | 只给能看到频道的成员推送离线通知 |
-| 拉取服务器详情时过滤频道列表 | 单用户路径 | delta/routes/servers/server_fetch | 返回给客户端的频道列表只包含可见频道 |
-| WebSocket Ready 时过滤频道订阅 | 单用户路径 | bonfire/events/impl (filter_accessible_channels) | 只订阅用户可见的频道事件主题 |
-| 权限变更时重新计算订阅 | 单用户路径 | bonfire/events/impl (recalculate_server) | 权限变化后自动订阅/退订对应频道 |
+| 场景 | 细分 | 使用路径 | 入口模块 | 是否做频道可见性过滤 | 核心目的 |
+|------|------|---------|----------|---------------------|---------|
+| 发送消息时过滤 @提及目标 | 单用户提及（@成员） | 批量路径 | delta → Message::create_from_api | **是**（第二级过滤） | 防止在隐藏频道中 @ 了看不到该频道的成员 |
+| 群体推送通知 | @everyone / @here 全员提及 | 批量路径（不调用可见性过滤） | pushd/mass_mention.rs @everyone 分支 | **否**，直接给全服务器成员加未读+推送 | 离线成员收到全员提及推送 |
+| 群体推送通知 | @role 角色提及 | 批量路径（调用可见性过滤） | pushd/mass_mention.rs @role 分支 | **是**，只给能看到频道的角色成员推送 | 离线角色成员收到推送，信息不外泄 |
+| 拉取服务器详情时过滤频道列表 | — | 单用户路径 | delta/routes/servers/server_fetch | **是**（对每个频道单独计算） | 返回给客户端的频道列表只包含可见频道 |
+| WebSocket Ready 时过滤频道订阅 | — | 单用户路径 | bonfire/events/impl (filter_accessible_channels) | **是**（对每个频道单独计算） | 只订阅用户可见的频道事件主题 |
+| 权限变更时重新计算订阅 | — | 单用户路径 | bonfire/events/impl (recalculate_server) | **是**（对每个频道单独计算） | 权限变化后自动订阅/退订对应频道 |
 
 ### 8.2 场景一：发送消息时过滤 @提及目标
 
@@ -563,6 +570,36 @@ if flags.has(MessageFlags::MentionsEveryone) {
 
 角色提及路径调用了批量可见性计算 [members_can_see_channel()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L28-L57)，只有既拥有该角色、又能看到频道、且不在线、且未被单独 @ 过的成员才会收到推送通知。
 
+#### 分支 A 与分支 B 的完整差异对比
+
+| 维度 | 分支 A：@everyone 全员提及 | 分支 B：@role 角色提及 |
+|------|--------------------------|----------------------|
+| 代码位置 | [mass_mention.rs#L135-L188](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L135-L188) | [mass_mention.rs#L189-L240](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L189-L240) |
+| 成员来源 | `fetch_all_members_chunked(server_id)` 拉取全服成员 | `fetch_all_members_with_roles_chunked(server_id, roles)` 拉取指定角色成员 |
+| 是否调用 `members_can_see_channel()` | **否**，完全不调用 | **是**，对每个分块成员调用 |
+| 未读计数（add_mention_to_many_unreads） | 对全服成员**直接加未读**，不管能否看到频道 | **完全不调用**此函数，未读通过 ack 任务另行处理 |
+| 可见性过滤方式 | 无（全服成员一视同仁） | 可见性过滤后，只保留 `viewable == true` 的成员 |
+| 推送过滤条件 | `不在线 && 不在 existing_mentions` | `能看到频道 && 不在线 && 不在 existing_mentions` |
+| 查询对象（query）使用 | 只用于初始化，不在 @everyone 分支中调用 | 克隆后调用 `query.members(chunk).members_can_see_channel()` |
+
+#### 处理逻辑为什么会有这样的差异
+
+从代码结构推断，这一差异源于**预期语义的不同**：
+
+- **@role 的语义是"通知拥有该角色的人"**，但角色本身不保证频道可见性。比如 @Moderator 可能在某个内部频道中提到了管理员，但并非所有管理员都能看到该内部频道（可能有些管理员属于不同部门）。因此必须在推送前做可见性过滤，确保消息内容不泄露给看不到频道的角色成员。
+
+- **@everyone 的语义是"通知全服务器所有人"**，典型使用场景是服务器公告。如果 @everyone 也按频道可见性过滤，则公告频道的可见性与 @everyone 的"全员通知"意图矛盾——如果管理者希望某个公告让所有人看到，就会把公告频道设为全员可见；如果希望隐藏公告频道，本就不应在隐藏频道里使用 @everyone。代码选择了"信任使用者的设置、不做额外过滤、保证通知到达率"的策略，代价是隐藏频道中使用 @everyone 可能导致信息泄露给看不到该频道的成员。
+
+这一差异体现在代码中就是：`if flags.has(MentionsEveryone)` 块完全没有使用外层构造的 `BulkDatabasePermissionQuery`，而是独立走了一条"全量拉取→加未读→在线过滤→推送"的流水线，与可见性计算彻底解耦。
+
+#### 信息泄露风险说明
+
+如果在**私有频道**（默认 deny ViewChannel，仅特定角色 allow）中发送包含敏感内容的 @everyone 消息，由于全员提及路径不做可见性过滤：
+1. 所有服务器成员都会在该频道下增加一个未读计数（即使他们在客户端左侧列表中看不到该频道条目）
+2. 不在线的所有服务器成员都会收到包含消息正文的推送通知（敏感内容直接泄露到移动端/桌面端）
+
+在使用 @everyone 功能时应意识到该行为。
+
 ### 8.4 场景三：拉取服务器详情时过滤频道列表
 
 入口位置：[server_fetch.rs::fetch()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/delta/src/routes/servers/server_fetch.rs#L27-L39)
@@ -656,12 +693,12 @@ for (channel_id, channel) in &self.cache.channels {
 
 代码库在不同场景下选择批量路径还是单用户路径，遵循以下原则：
 
-| 原则 | 批量路径 | 单用户路径 |
-|------|---------|-----------|
+| 原则 | 批量路径（含可见性过滤的调用） | 单用户路径 |
+|------|------------------------------|-----------|
 | **适用场景** | N 个成员 × 1 个频道 | 1 个用户 × N 个频道 |
 | **性能优势** | 一次数据库查询批量拉取成员、角色、权限，避免 N 次往返 | 完整权限语义准确，适合需要精确判断多种权限位的场景 |
 | **语义完整性** | 省略了语音限制、频道级超时兜底、revoke_all（见第 7 节） | 所有限制步骤完整执行 |
-| **调用方** | Message::create_from_api（过滤 @提及）、pushd/mass_mention（角色提及推送） | server_fetch（频道列表）、bonfire Ready、bonfire 权限重算 |
+| **调用方** | Message::create_from_api（过滤 @提及，L514-L520）、pushd/mass_mention 中 **仅 @role 分支**（L189-L240）。注意：@everyone 分支（L135-L188）虽走批量流水线，但完全不调用可见性过滤。 | server_fetch（频道列表）、bonfire Ready、bonfire 权限重算 |
 
-选择批量路径的两个场景都只需要判断 `ViewChannel` 这一位，因此省略的限制步骤不影响结果正确性。若未来有场景需要批量判断 `SendMessage`、`Speak` 等更细粒度权限，则不能直接复用当前批量路径，需要补齐缺失的限制步骤。
+实际调用 `members_can_see_channel()` 做可见性过滤的两处场景（Message @提及过滤、@role 推送）都只需要判断 `ViewChannel` 这一位，因此批量路径省略的限制步骤不影响结果正确性。若未来有场景需要批量判断 `SendMessage`、`Speak` 等更细粒度权限，则不能直接复用当前批量路径，需要补齐缺失的限制步骤。
 
