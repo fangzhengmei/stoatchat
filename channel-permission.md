@@ -466,15 +466,55 @@ if !permissions.has_channel_permission(ChannelPermission::ViewChannel) {
 | WebSocket Ready 时过滤频道订阅 | — | 单用户路径 | bonfire/events/impl (filter_accessible_channels) | **是**（对每个频道单独计算） | 只订阅用户可见的频道事件主题 |
 | 权限变更时重新计算订阅 | — | 单用户路径 | bonfire/events/impl (recalculate_server) | **是**（对每个频道单独计算） | 权限变化后自动订阅/退订对应频道 |
 
-### 8.2 场景一：发送消息时过滤 @提及目标
+---
 
-这是批量可见性计算除推送外的**另一个重要调用方**，但经常被忽略。
+### 8.2 消息通知的两层架构总览
 
-入口位置：[Message::create_from_api()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/models/messages/model.rs#L491-L534)
+在展开各场景之前，需要先理解后端消息通知的**两层架构**。所有消息的未读写入和推送发送都涉及两个异步处理层，三条路径（普通用户提及、全员提及、角色提及）在这两层中的行为各不相同。
+
+```
+消息发送 (Message::send)
+       │
+       ▼
+  ack 任务队列 (tasks::ack::queue_message)
+       │
+       ├── 第一层：ack worker (handle_ack_event)
+       │    ├── 给 recipients 中的用户加未读 (add_mention_to_unread)
+       │    ├── 给 recipients 发普通推送 (amqp.message_sent)
+       │    └── 如果是 mass mention → 发 mass_mention 事件 (amqp.mass_mention_message_sent)
+       │
+       └── 第二层：pushd mass_mention 消费者
+            ├── @everyone 分支：全服成员加未读 + 全服离线成员发推送（不做可见性过滤）
+            └── @role 分支：可见性过滤后的角色成员发推送（不加未读）
+```
+
+**第一层：ack 任务层** — 入口在 [tasks::ack::handle_ack_event()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/tasks/ack.rs#L84-L210)
+
+所有消息都会经过这一层。它处理：
+- 给 `recipients`（收件人列表）中的每个用户**逐个加未读**：`db.add_mention_to_unread(channel, user, message_ids)`
+- 给 `recipients` 中的用户发**普通推送**：`amqp.message_sent(recipients, push)`
+- 如果消息包含 `@everyone` 或 `@role`（即 `contains_mass_push_mention()` 返回 true），则额外通过 `amqp.mass_mention_message_sent()` 发一个 **mass mention 事件**到独立队列，由 pushd 进一步处理
+
+**第二层：pushd mass_mention 层** — 入口在 [MassMessageConsumer::consume()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L95-L245)
+
+只有 `@everyone` 和 `@role` 消息才会到达这一层。这一层的目的是处理"收件人数量巨大、无法在 ack 任务中同步处理"的群体提及。
+
+关键注意点：
+- **ack 层的 recipients**（TextChannel 场景下）等于 `message.mentions`，即**单独 @ 的用户**，不包含全员成员或角色成员
+- 因此 ack 层只给少量被单独 @ 的用户加未读和发推送，而大量的全员/角色成员需要在 pushd 层处理
+- 但 pushd 层中，@everyone 和 @role 的处理方式存在**多处不一致**，详见 8.3 节
+
+---
+
+### 8.3 场景一：普通用户提及（@成员）
+
+入口位置：消息写入阶段在 [Message::create_from_api()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/models/messages/model.rs#L491-L534)，未读与推送阶段在 [ack::handle_ack_event()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/tasks/ack.rs#L120-L185)
+
+#### 8.3.1 消息写入时的两级过滤
 
 当消息内容包含用户提及（`@某成员`）时，在 `TextChannel` 场景下会经历**两级过滤**：
 
-#### 第一级：服务器成员身份过滤
+##### 第一级：服务器成员身份过滤
 
 ```rust
 let valid_members = db.fetch_members(server.as_str(), &mentions_vec[..]).await;
@@ -487,7 +527,7 @@ if let Ok(valid_members) = valid_members {
 
 先把所有不是该服务器成员的被提及用户剔除。比如 A 服务器成员 @ 了 B 服务器的成员，这一级就把 B 过滤掉。
 
-#### 第二级：频道可见性过滤
+##### 第二级：频道可见性过滤
 
 ```rust
 if !user_mentions.is_empty() {
@@ -506,12 +546,64 @@ if !user_mentions.is_empty() {
 
 调用批量路径 [members_can_see_channel()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L28-L57)，对所有剩余的被提及成员一次性计算"能否看到当前频道"。不能看到的，从 `user_mentions` 集合中移除，最终消息的 `mentions` 字段只保留能看到该频道的用户 ID。
 
-#### 业务目的
+这两级过滤的业务目的：
+- **防止信息泄露**：如果在私有频道中 @ 了一个看不到该频道的成员，该成员不应出现在消息的 `mentions` 列表中
+- **未读计数准确**：只有能看到频道的成员才会在后续 ack 任务中被加未读
 
-- **防止信息泄露**：如果在私有频道中 @ 了一个看不到该频道的成员，该成员不应出现在消息的 `mentions` 列表中，也不会收到未读提醒和推送通知。
-- **未读计数准确**：只有能看到频道的成员才会有未读计数增加。
+#### 8.3.2 ack 任务层的未读写入与推送发送
 
-#### 单元测试验证
+消息写入数据库后，通过 `Message::send()` 调用 `tasks::ack::queue_message()` 将消息入队，由 ack worker 异步处理。
+
+**未读写入**（[ack.rs#L120-L152](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/tasks/ack.rs#L120-L152)）：
+
+```rust
+let mut users: HashSet<&String> = HashSet::new();
+messages.iter().for_each(|(_, _, recipents, _)| {
+    users.extend(recipents.iter());
+});
+
+for user in users {
+    let message_ids: Vec<String> = messages
+        .iter()
+        .filter_map(|(_, message, recipients, _)| {
+            if recipients.contains(user) {
+                Some(message.id.clone())
+            } else { None }
+        })
+        .collect();
+
+    if !message_ids.is_empty() {
+        db.add_mention_to_unread(channel, user, &message_ids).await?;
+    }
+}
+```
+
+遍历所有 recipients（即 `message.mentions` 中的用户 ID），逐个调用 `add_mention_to_unread()` 给每个用户加未读。注意是**逐个用户写入**，不是批量写入。
+
+**推送发送**（[ack.rs#L156-L180](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/tasks/ack.rs#L156-L180)）：
+
+```rust
+for (push, message, recipients, silenced) in messages {
+    if *silenced || push.is_none()
+        || (recipients.is_empty() && !message.contains_mass_push_mention())
+    {
+        continue;
+    }
+    amqp.message_sent(recipients.clone(), push.clone().unwrap()).await;
+}
+```
+
+通过 `amqp.message_sent()` 给所有 recipients 发推送通知。
+
+#### 8.3.3 普通提及路径总结
+
+| 阶段 | 处理内容 | 是否做可见性过滤 | 未读写入方式 |
+|------|---------|----------------|-------------|
+| 消息写入 | 两级过滤后将结果写入 message.mentions 字段 | **是**（成员身份 + 频道可见性） | 不在此阶段写 |
+| ack 任务层 | 给 recipients（= message.mentions）加未读 + 发普通推送 | 否（依赖写入阶段已过滤） | 逐个用户调用 add_mention_to_unread |
+| pushd mass_mention 层 | 不经过（普通提及不触发 mass mention 事件） | — | — |
+
+#### 8.3.4 单元测试验证
 
 该逻辑在 [message_send.rs 的 message_mention_constraints 测试](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/delta/src/routes/channels/message_send.rs#L208-L403) 中被完整覆盖了三种情况：
 1. 被提及者不是服务器成员 → 被过滤
@@ -520,37 +612,72 @@ if !user_mentions.is_empty() {
 
 测试断言三次发送的 `message.mentions` 字段分别为空、空、非空。
 
-### 8.3 场景二：@everyone/@role 群体推送通知
+---
 
-入口位置：[pushd/mass_mention.rs::consume()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L95-L245)
+### 8.4 场景二：@everyone / @role 群体推送通知
 
-当消息标记了 `MentionsEveryone` 或包含角色提及时，pushd 消费该事件，按成员批量发送推送通知。此场景下**只有角色提及路径使用了可见性过滤**，`@everyone` 路径则未过滤。
+入口位置：ack 层在 [ack.rs#L182-L205](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/tasks/ack.rs#L182-L205)，pushd 层在 [mass_mention.rs::consume()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L95-L245)
 
-#### 分支 A：@everyone —— 不做可见性过滤
+当消息标记了 `MentionsEveryone` 或包含角色提及时，ack 层会通过 `amqp.mass_mention_message_sent()` 触发第二层处理。此场景下 @everyone 和 @role 的处理逻辑存在**多处关键差异**，包括是否做可见性过滤、是否写未读等。
+
+#### 8.4.1 ack 层的共同处理
+
+@everyone 和 @role 在 ack 层的处理是**完全相同**的：
+
+1. **给单独 @ 的用户加未读和发推送**：recipients = `message.mentions`（只包含被单独 @ 的用户，**不包含**全员成员或角色成员），这部分处理与普通提及完全一致
+2. **检测到 mass mention 后触发第二层**：如果 `contains_mass_push_mention()` 返回 true（即有 MentionsEveryone 标志或 role_mentions 非空），则收集到 `mass_mentions` 向量中，最后通过 `amqp.mass_mention_message_sent(server, mass_mentions)` 发送到独立队列
+
+关键区别都发生在 **pushd mass_mention 层**。
+
+#### 8.4.2 分支 A：@everyone —— 不做可见性过滤、直接加未读
+
+代码位置：[mass_mention.rs#L135-L188](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L135-L188)
 
 ```rust
 if flags.has(MessageFlags::MentionsEveryone) {
     let mut db_query = self.db.fetch_all_members_chunked(&payload.server_id).await?;
     loop {
-        // 分块拉取成员
-        // ...
-        // 直接给所有人加未读，不检查可见性
-        self.db.add_mention_to_many_unreads(push.channel.id(), &userids, &ack_chnl).await;
-        // 再过滤掉在线用户和已有提及，剩余的发推送
+        // 分块拉取全服成员
+        let (userids, ack_chnl, exhausted, online_users, existing_mentions, _) =
+            next_chunk(&mut db_query, &push).await?;
+
+        // 直接给全服成员批量加未读，不检查可见性
+        self.db
+            .add_mention_to_many_unreads(push.channel.id(), &userids, &ack_chnl)
+            .await;
+
+        // 过滤掉在线用户和已有提及，剩余的发推送
+        let target_users: Vec<String> = userids
+            .iter()
+            .filter(|uid| !online_users.contains(*uid) && !existing_mentions.contains(*uid))
+            .cloned()
+            .collect();
+
         self.fire_notification_for_users(&push, &target_users).await?;
     }
 }
 ```
 
-注意此处调用了 `add_mention_to_many_unreads` 但**没有调用 `members_can_see_channel()`**。这意味着在 @everyone 场景下，即使成员看不到该频道，也会被加上未读计数并可能收到推送（推送环节只做了在线过滤）。这是一个已知的设计特性。
+**未读处理**：调用 `add_mention_to_many_unreads()` **批量**给全服所有成员加未读。这是一个批量数据库操作（MongoDB 中是 `update_many`），比逐个用户写入高效得多。
 
-#### 分支 B：@role —— 使用可见性过滤
+**推送处理**：过滤掉**在线用户**（在线用户通过 WebSocket 实时收到消息，不需要推送）和**已被单独 @ 的用户**（这些用户在 ack 层已经收到过普通推送，避免重复推送），剩余的离线用户收到推送。
+
+**可见性过滤**：**完全不做**。`BulkDatabasePermissionQuery` 对象虽然在函数开头构造了，但在 @everyone 分支中从未被使用。
+
+#### 8.4.3 分支 B：@role —— 做可见性过滤、不加未读
+
+代码位置：[mass_mention.rs#L189-L240](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L189-L240)
 
 ```rust
 } else if let Some(roles) = &push.message.role_mentions {
-    let mut role_members = self.db.fetch_all_members_with_roles_chunked(&payload.server_id, roles).await?;
+    let mut role_members =
+        self.db.fetch_all_members_with_roles_chunked(&payload.server_id, roles).await?;
     while !exhausted {
-        // 分块拉取有该角色的成员
+        // 分块拉取拥有该角色的成员
+        let (chunk, _, exhausted, online_users, existing_mentions, query) =
+            next_chunk(&mut role_members, &push).await?;
+
+        // 先做可见性过滤：只保留能看到频道的成员
         let mut q = query.clone().members(&chunk);
         let viewing_members: Vec<String> = q
             .members_can_see_channel()
@@ -562,27 +689,39 @@ if flags.has(MessageFlags::MentionsEveryone) {
                 } else { None }
             })
             .collect();
+
         // 再过滤掉在线用户，剩余的发推送
+        let targets: Vec<String> = viewing_members
+            .into_iter()
+            .filter(|uid| !online_users.contains(uid))
+            .collect();
+
         self.fire_notification_for_users(&push, &targets).await?;
     }
 }
 ```
 
-角色提及路径调用了批量可见性计算 [members_can_see_channel()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/core/database/src/util/bulk_permissions.rs#L28-L57)，只有既拥有该角色、又能看到频道、且不在线、且未被单独 @ 过的成员才会收到推送通知。
+**未读处理**：**完全不加未读**。@role 分支中没有任何 `add_mention_to_*` 的调用。这是与 @everyone 分支最关键的差异之一——角色成员虽然能收到推送通知，但他们的频道未读计数中的 mentions 数量**不会增加**。
 
-#### 分支 A 与分支 B 的完整差异对比
+**推送处理**：先做可见性过滤，再过滤掉在线用户和已单独 @ 的用户，剩余的收到推送。
 
-| 维度 | 分支 A：@everyone 全员提及 | 分支 B：@role 角色提及 |
-|------|--------------------------|----------------------|
-| 代码位置 | [mass_mention.rs#L135-L188](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L135-L188) | [mass_mention.rs#L189-L240](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L189-L240) |
-| 成员来源 | `fetch_all_members_chunked(server_id)` 拉取全服成员 | `fetch_all_members_with_roles_chunked(server_id, roles)` 拉取指定角色成员 |
+**可见性过滤**：**做**。调用 `members_can_see_channel()` 批量计算每个角色成员对该频道的可见性，只有 `viewable == true` 的成员才保留。
+
+#### 8.4.4 @everyone 与 @role 的完整差异对比
+
+| 维度 | @everyone 全员提及 | @role 角色提及 |
+|------|-------------------|--------------|
+| pushd 层代码位置 | [mass_mention.rs#L135-L188](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L135-L188) | [mass_mention.rs#L189-L240](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/daemons/pushd/src/consumers/inbound/mass_mention.rs#L189-L240) |
+| 成员来源 | `fetch_all_members_chunked(server_id)` 全服成员 | `fetch_all_members_with_roles_chunked(server_id, roles)` 指定角色成员 |
 | 是否调用 `members_can_see_channel()` | **否**，完全不调用 | **是**，对每个分块成员调用 |
-| 未读计数（add_mention_to_many_unreads） | 对全服成员**直接加未读**，不管能否看到频道 | **完全不调用**此函数，未读通过 ack 任务另行处理 |
-| 可见性过滤方式 | 无（全服成员一视同仁） | 可见性过滤后，只保留 `viewable == true` 的成员 |
+| pushd 层未读写入 | `add_mention_to_many_unreads()` 批量加未读 | **完全不加未读**（无任何 add_mention 调用） |
+| 未读写入方式 | 批量（update_many） | — |
+| 可见性过滤 | 无（全服成员一视同仁） | 可见性过滤后，只保留 `viewable == true` 的成员 |
 | 推送过滤条件 | `不在线 && 不在 existing_mentions` | `能看到频道 && 不在线 && 不在 existing_mentions` |
 | 查询对象（query）使用 | 只用于初始化，不在 @everyone 分支中调用 | 克隆后调用 `query.members(chunk).members_can_see_channel()` |
+| ack 层是否处理 | 是（给单独 @ 的用户加未读+推送） | 是（给单独 @ 的用户加未读+推送） |
 
-#### 处理逻辑为什么会有这样的差异
+#### 8.4.5 处理逻辑为什么会有这样的差异
 
 从代码结构推断，这一差异源于**预期语义的不同**：
 
@@ -590,9 +729,14 @@ if flags.has(MessageFlags::MentionsEveryone) {
 
 - **@everyone 的语义是"通知全服务器所有人"**，典型使用场景是服务器公告。如果 @everyone 也按频道可见性过滤，则公告频道的可见性与 @everyone 的"全员通知"意图矛盾——如果管理者希望某个公告让所有人看到，就会把公告频道设为全员可见；如果希望隐藏公告频道，本就不应在隐藏频道里使用 @everyone。代码选择了"信任使用者的设置、不做额外过滤、保证通知到达率"的策略，代价是隐藏频道中使用 @everyone 可能导致信息泄露给看不到该频道的成员。
 
-这一差异体现在代码中就是：`if flags.has(MentionsEveryone)` 块完全没有使用外层构造的 `BulkDatabasePermissionQuery`，而是独立走了一条"全量拉取→加未读→在线过滤→推送"的流水线，与可见性计算彻底解耦。
+至于 **@role 不加未读**，这更可能是一个**实现遗漏**而非有意设计：
+- @everyone 分支的 `add_mention_to_many_unreads` 调用紧邻在成员拉取之后
+- @role 分支在可见性过滤后有了 `viewing_members` 列表，理论上同样可以调用 `add_mention_to_many_unreads` 给这些可见成员加未读，但代码中没有这一步
+- 从功能一致性角度，被 @role 提及的用户应该和被 @everyone 提及的用户一样，在未读计数中体现为提及未读
 
-#### 信息泄露风险说明
+这一差异导致的实际效果是：收到 @role 推送的用户点开频道后，看到的是普通未读（last_id 未读），而非红色的提及未读（mentions 未读）。
+
+#### 8.4.6 信息泄露风险说明
 
 如果在**私有频道**（默认 deny ViewChannel，仅特定角色 allow）中发送包含敏感内容的 @everyone 消息，由于全员提及路径不做可见性过滤：
 1. 所有服务器成员都会在该频道下增加一个未读计数（即使他们在客户端左侧列表中看不到该频道条目）
@@ -600,7 +744,9 @@ if flags.has(MessageFlags::MentionsEveryone) {
 
 在使用 @everyone 功能时应意识到该行为。
 
-### 8.4 场景三：拉取服务器详情时过滤频道列表
+---
+
+### 8.5 场景三：拉取服务器详情时过滤频道列表
 
 入口位置：[server_fetch.rs::fetch()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/delta/src/routes/servers/server_fetch.rs#L27-L39)
 
@@ -625,7 +771,7 @@ for channel in all_channels {
 
 由于这里是单用户视角且频道数量通常远小于成员数量（一个服务器最多几十上百个频道），使用完整的单用户路径是合理的——不需要批量优化，且完整路径确保了超时、语音限制、revoke_all 等全部约束都被正确应用。
 
-### 8.5 场景四：WebSocket Ready 时过滤频道订阅
+### 8.6 场景四：WebSocket Ready 时过滤频道订阅
 
 入口位置：[bonfire/events/impl.rs::generate_ready_payload()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/bonfire/src/events/impl.rs#L140-L145)
 
@@ -654,7 +800,7 @@ calculate_channel_permissions(&mut query)
 
 对非 TextChannel 类型（DM、Group、SavedMessages）直接返回 `true`，因为这些频道的成员集合本身就是白名单，不需要额外权限判断。
 
-### 8.6 场景五：权限变更时重新计算订阅
+### 8.7 场景五：权限变更时重新计算订阅
 
 入口位置：[bonfire/events/impl.rs::recalculate_server()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-backend/crates/bonfire/src/events/impl.rs#L335-L399)
 
@@ -689,7 +835,7 @@ for (channel_id, channel) in &self.cache.channels {
 
 这保证了客户端实时感知权限变更对频道可见性的影响，不需要刷新页面。
 
-### 8.7 两条路径的选择策略总结
+### 8.8 两条路径的选择策略总结
 
 代码库在不同场景下选择批量路径还是单用户路径，遵循以下原则：
 
