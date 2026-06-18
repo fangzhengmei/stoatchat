@@ -153,6 +153,94 @@ pub async fn join(db: &State<Database>, amqp: &State<AMQP>, user: User, target: 
 2. **群规模上限**：`recipients.len() >= config.features.limits.global.group_size` → `GroupTooLarge`（默认 100，见 [crates/core/config/Revolt.toml](crates/core/config/Revolt.toml#L222)）。
 3. 加入 recipients、写库、发 `ChannelGroupJoin` 与 `UserAdded` 系统消息。
 
+### 5.4 并发边界：服务器数量检查与成员写入是否原子？**不是原子，存在竞态窗口**
+
+核销路径 `join` 的实际执行顺序是（[crates/delta/src/routes/invites/invite_join.rs](crates/delta/src/routes/invites/invite_join.rs#L21-L27)）：
+
+```
+① user.can_acquire_server(db).await?    // count_documents 读取
+   ...（中间还夹杂了 as_invite / fetch_server 等多次 DB 调用）...
+② Member::create(db, &server, &user, None).await?  // insert_or_merge_member 写入
+```
+
+两步是**两次独立的数据库调用**，中间没有任何事务、锁或 session 级隔离。全代码库只有 `fetch_all_members_chunked` 和 `fetch_all_members_with_roles_chunked` 用了 `start_transaction()` + `ReadConcern::snapshot()`（[crates/core/database/src/models/server_members/ops/mongodb.rs](crates/core/database/src/models/server_members/ops/mongodb.rs#L98-L120)），而核销路径完全没用到。
+
+竞态窗口内，如果同一用户并发 N 次核销，所有请求都可能在步骤①读到相同的“未超限”结果，然后各自走到步骤②并发写入。最终：
+
+- `server_members` 集合 `_id` 是复合主键 `(server, user)`，并且在初始化脚本里建了复合索引 `compound_id`（[crates/core/database/src/models/admin_migrations/ops/mongodb/init.rs](crates/core/database/src/models/admin_migrations/ops/mongodb/init.rs#L187-L206)）。MongoDB 的 `_id` 本身隐含唯一性约束，**同一用户对同一服务器并发写入最终只有一条成功，其余会因主键冲突失败**。但失败不会被翻译成业务错误，而是以 5xx 数据库错误抛给上层（`insert_or_merge_member` 内部对正常分支用的是裸 `query!(self, insert_one, COL, &member)`，没有捕获并转成 `AlreadyInServer`）。
+- 但 `insert_or_merge_member` 还有一个“软删除恢复”分支：若先查询到带 `pending_deletion_at` 的旧记录，则走 `find_one_and_update` 把它复活（[crates/core/database/src/models/server_members/ops/mongodb.rs](crates/core/database/src/models/server_members/ops/mongodb.rs#L17-L52)）。这条路径下的检查 (`existing.is_ok_and(|x| x.is_some())`) 也不是原子的——两个并发请求都可能同时判定“存在待恢复记录”，然后并发执行 update，结果是 MongoDB 端幂等，但应用层会返回两份“已恢复”的结果。
+
+结论：**并发核销可以绕过 `can_acquire_server` 的计数检查**（虽然对“同一服务器重复加入”最终被复合主键兜住了，但对“同时加入多个不同服务器”的超限没有数据库层兜底，会让用户最终加入的服务器数超过配额）。
+
+### 5.5 并发边界：群组重复加入是否可能重复写入？**可能——内存检查 + 无唯一数组约束会产生重复 recipient**
+
+`add_user_to_group` 的时序：
+
+```
+① if let Channel::Group { recipients, .. } = self {
+     if recipients.contains(&String::from(&user.id)) {   // 内存中检查
+         return Err(create_error!(AlreadyInGroup));
+     }
+     recipients.push(String::from(&user.id));             // 内存中 push
+  }
+② db.add_user_to_group(id, &user.id).await?              // MongoDB $push 到数组
+```
+
+[crates/core/database/src/models/channels/model.rs](crates/core/database/src/models/channels/model.rs#L347-L364)
+
+而 `add_user_to_group` 的 DB 层是裸 `$push`，**没有 `$addToSet`，也没有任何前置查询条件**：
+
+```rust
+self.col::<Document>(COL)
+    .update_one(
+        doc! { "_id": channel },
+        doc! { "$push": { "recipients": user } },
+    )
+```
+
+[crates/core/database/src/models/channels/ops/mongodb.rs](crates/core/database/src/models/channels/ops/mongodb.rs#L108-L123)
+
+竞态：两个并发请求都在步骤①读到 `recipients` 里没有该用户 → 都通过检查 → 都执行 `$push` → **`recipients` 数组里最终会出现两个相同的 user_id**。同时这也绕过了 `recipients.len() >= group_size` 的群规模上限（如果两个并发请求都在边界上读，都认为还有 1 个空位，就可能把群推到 `group_size + 1` 甚至更多）。
+
+修复方向：把条件下推到 MongoDB，用 `update_one(doc! { "_id": channel, "recipients": { "$ne": user } }, doc! { "$push": ... })` 或者直接改用 `$addToSet`。
+
+---
+
+## 5.6 并发边界：群组邀请非创建者删除的实际表现？**panic，当前请求线程异常终止**
+
+删除分支 [crates/delta/src/routes/invites/invite_delete.rs](crates/delta/src/routes/invites/invite_delete.rs#L21-L32)：
+
+```rust
+match invite {
+    Invite::Server { code, server, .. } => { /* 校验 ManageServer 权限后删除 */ }
+    _ => unreachable!(),
+}
+```
+
+- 当 `invite` 是 `Invite::Group` 且删除者不是创建者时，进入 `_ => unreachable!()`。
+- Rust 的 `unreachable!()` 是 `panic!` 的别名，会让**当前处理请求的工作线程 panic**。
+- Rocket 默认启用 `panic = "unwind"`，单个请求 panic 不会拉垮整个服务，但客户端会收到 500 而非业务错误码；同时日志里会留下 `thread '<unnamed>' panicked at 'internal error: entered unreachable code'` 之类的堆栈。
+- 群组邀请没有类似“群组管理员”的权限 fallback，所以非创建者删除群组邀请的正常路径根本不存在——要么是创建者本人删，要么就是 500 panic。
+
+### 5.7 并发边界：签发随机码冲突有没有重试？**没有——应用层无重试，依赖 MongoDB _id 隐含唯一性**
+
+签发流程 [crates/core/database/src/models/channel_invites/model.rs](crates/core/database/src/models/channel_invites/model.rs#L60-L84)：
+
+```rust
+let code = nanoid::nanoid!(8, &ALPHABET);  // 单次生成
+let invite = ... ;
+db.insert_invite(&invite).await?;          // 直接插入
+```
+
+没有 `loop`、没有 `retry`、没有对“duplicate key”错误的捕获与换码重试。
+
+数据库层侧：
+
+- `channel_invites` 集合初始化时只 `create_collection`，**没有单独的 `createIndexes` 调用**（[crates/core/database/src/models/admin_migrations/ops/mongodb/init.rs](crates/core/database/src/models/admin_migrations/ops/mongodb/init.rs#L39-L41)），但 `Invite` 序列化后 `code` 字段被 `#[serde(rename = "_id")]` 映射为 MongoDB 的 `_id`（[crates/core/database/src/models/channel_invites/model.rs](crates/core/database/src/models/channel_invites/model.rs#L17-L31)），而 MongoDB 对 `_id` 自带全局唯一索引，因此重复的 code 插入一定会报 duplicate key error。
+- 应用层没有把 `E11000 duplicate key error` 翻译成“生成新 code 重试”，而是通过 `query!` 宏直接转成 `InternalError`（500）返回给客户端。
+
+概率层面：54 字符 × 8 位 = 54^8 ≈ 7.2e13 空间，碰撞概率极低，所以实际上这个缺口只在极端规模或故意攻击时才会触发，但从工程上讲缺失了冲突重试机制。
+
 ---
 
 ## 6. 有效期校验（重要结论）
