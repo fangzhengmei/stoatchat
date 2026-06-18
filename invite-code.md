@@ -239,6 +239,48 @@ db.insert_invite(&invite).await?;          // 直接插入
 
 概率层面：54 字符 × 8 位 = 54^8 ≈ 7.2e13 空间，碰撞概率极低，所以实际上这个缺口只在极端规模或故意攻击时才会触发，但从工程上讲缺失了冲突重试机制。
 
+### 5.8 群组路径的服务器数量检查：群组邀请也被 `can_acquire_server` 校验——这是设计缺陷
+
+核销入口 `join` 的时序如下（[crates/delta/src/routes/invites/invite_join.rs](crates/delta/src/routes/invites/invite_join.rs#L17-L48)）：
+
+```rust
+if user.bot.is_some() { return Err(create_error!(IsBot)); }
+
+user.can_acquire_server(db).await?;   // ← 注意：在 Server/Group 分支判断之前就调用了
+
+let invite = target.as_invite(db).await?;
+match &invite {
+    Invite::Server { .. } => { /* 加入服务器 */ }
+    Invite::Group { .. } => { /* 加入群组 */ }
+}
+```
+
+`can_acquire_server` 是在 **所有分支之前** 统一调用的，意味着无论是服务器邀请还是群组邀请，**都会先过一遍服务器数量上限检查**。
+
+#### 服务器配额满时群组邀请的实际返回值
+
+当用户已加入的服务器数 `>` 限额（或 `>=`，见 off-by-one）时，`can_acquire_server` 返回：
+
+```rust
+Err(create_error!(TooManyServers {
+    max: self.limits().await.servers
+}))
+```
+
+对应 HTTP 错误体是：
+```json
+{ "type": "TooManyServers", "max": 100 }
+```
+
+这意味着：**用户在群组邀请上会收到一个说"你服务器加太多了"的错误**。这在语义上是错误的——加入群组（一个频道）不应该受"服务器数量上限"约束，也不会在 `server_members` 里新增记录，更不会计入服务器计数。
+
+#### 影响范围
+- 只影响 `Invite::Group` 类型的邀请（直接指向群组频道的邀请）。
+- 通过可发现服务器 ID 解析的虚拟邀请（`Invite::Server`）不受此影响，因为它们走 Server 分支。
+- `add_user_to_group` 内部本身没有任何服务器配额检查，只有群组自己的 `AlreadyInGroup` 和 `GroupTooLarge` 检查。
+
+修复方向：把 `user.can_acquire_server(db).await?` 下移到 `Invite::Server` 分支内部，仅在加入服务器前调用。
+
 ---
 
 ## 6. 有效期校验（重要结论）
@@ -330,16 +372,25 @@ pub async fn can_acquire_server(&self, db: &Database) -> Result<()> {
 
 > 注意：`/invites/*` 没有按邀请码或按用户细分桶，仅有一个全局 `any` 桶（20/窗口）兜底。
 
-### 8.3 潜在滥用面（当前未覆盖）
-- **无使用次数上限**：邀请码可被无限次核销（无 `max_uses`）。
-- **无有效期**：见第 6 节。
-- **无签发数量上限**：见第 3 节。
-- **等于限额时仍放行**：见 8.1。
-- **服务器数量检查与成员写入非原子**：见 5.4，并发核销可绕过 `can_acquire_server` 限额。
-- **群组并发加入可能产生重复 recipient 并绕过群规模上限**：见 5.5，内存检查 + `$push` 无原子性。
-- **群组邀请非创建者删除会 500 panic**：见 5.6，`unreachable!()` 直接 panic 而非返回业务错误。
-- **邀请码随机码冲突无重试**：见 5.7，应用层不捕获 duplicate key 并换码，冲突时返回 500。
-- 因此对“恶意扩散邀请码”的防护主要依赖：速率限制、`ManageServer` 持有者手动删除、服务器封禁（`Banned`）以及 `can_acquire_server` 对加入方数量的限制，而非邀请码本身的额度/时效约束。
+### 8.3 防护缺口汇总（与正文逐点对应）
+
+下表把正文里分析过、但未被防滥用机制兜住的边界逐条列出，每一项都能在正文中找到对应分析章节与代码证据。
+
+| # | 缺口类别 | 具体表现 | 对应正文 | 代码证据 |
+|---|---------|---------|---------|---------|
+| G1 | 签发数量 | 单用户/单频道/单服务器签发邀请码数量无上限，可无限创建 | §3 签发限额 | [crates/delta/src/routes/channels/invite_create.rs](crates/delta/src/routes/channels/invite_create.rs#L17-L37) |
+| G2 | 随机码冲突 | nanoid 仅生成一次直接插入；duplicate key 不换码重试，冲突时返回 500 | §5.7 | [crates/core/database/src/models/channel_invites/model.rs](crates/core/database/src/models/channel_invites/model.rs#L60-L84) |
+| G3 | 有效期 | 模型无 `expires_at`/`created_at`，DB 无 TTL，`crond` 无邀请码清理任务，邀请码永久有效 | §6 有效期校验 | [crates/core/database/src/models/channel_invites/model.rs](crates/core/database/src/models/channel_invites/model.rs#L11-L41) |
+| G4 | 使用次数 | 模型无 `uses`/`max_uses`，邀请码可被无限次核销 | §2 数据模型 | [crates/core/database/src/models/channel_invites/model.rs](crates/core/database/src/models/channel_invites/model.rs#L11-L41) |
+| G5 | 限额 off-by-one | `can_acquire_server` 用 `<=` 比较，已加入数等于限额时仍放行，最终可超限 1 个 | §8.1 | [crates/core/database/src/models/users/model.rs](crates/core/database/src/models/users/model.rs#L281-L289) |
+| G6 | 并发绕过服务器限额 | 计数检查与成员写入是两次独立 DB 调用，无事务；跨服务器并发核销可使最终加入数超过配额 | §5.4 | [crates/delta/src/routes/invites/invite_join.rs](crates/delta/src/routes/invites/invite_join.rs#L21-L27) |
+| G7 | 服务器并发重复加入未翻译错误 | 同服务器并发加入被 `_id` 复合主键拦住，但 duplicate key 未翻译成 `AlreadyInServer`，返回 500 | §5.4 | [crates/core/database/src/models/server_members/ops/mongodb.rs](crates/core/database/src/models/server_members/ops/mongodb.rs#L17-L52) |
+| G8 | 群组并发重复写入 | 内存 `contains` 检查 + 裸 `$push`，DB 不用 `$addToSet` 也无过滤条件，会产生重复 `recipient` | §5.5 | [crates/core/database/src/models/channels/ops/mongodb.rs](crates/core/database/src/models/channels/ops/mongodb.rs#L108-L123) |
+| G9 | 群规模上限可被并发绕过 | 内存 `len()` 检查不原子，并发边界请求可把群推到 `group_size + N` | §5.5 | [crates/core/database/src/models/channels/model.rs](crates/core/database/src/models/channels/model.rs#L347-L364) |
+| G10 | 群组邀请无权限 fallback | 非创建者删除群组邀请走 `unreachable!()`，当前线程 panic，客户端拿 500 而非业务错误 | §5.6、§7.3 | [crates/delta/src/routes/invites/invite_delete.rs](crates/delta/src/routes/invites/invite_delete.rs#L21-L32) |
+| G11 | 匿名可查询邀请信息 | `GET /invites/<code>` 无需登录，匿名可读取服务器/群组名称、图标、描述、创建者用户名头像、成员数 | §4.1、§4.2 | [crates/delta/src/routes/invites/invite_fetch.rs](crates/delta/src/routes/invites/invite_fetch.rs#L10-L12)、[crates/core/models/src/v0/channel_invites.rs](crates/core/models/src/v0/channel_invites.rs#L31-L84) |
+
+> 对"恶意扩散邀请码"的防护目前主要依赖：速率限制、`ManageServer` 持有者手动删除、服务器封禁（`Banned`）以及 `can_acquire_server` 对加入方数量的限制；邀请码本身**没有**额度/时效约束。
 
 ---
 
