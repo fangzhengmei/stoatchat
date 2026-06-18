@@ -298,7 +298,7 @@ pub async fn p(self, channel: String) {
 
 [server_members/model.rs#L164-L184](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/model.rs#L164-L184)
 
-#### 事件一：`ServerMemberJoin` —— 广播给所有服务器成员
+#### 事件一：`ServerMemberJoin` —— 广播给服务器频道
 
 ```rust
 EventV1::ServerMemberJoin {
@@ -310,7 +310,9 @@ EventV1::ServerMemberJoin {
 .await;
 ```
 
-作用：通知服务器上现有成员"有新用户加入"。但在服务器刚创建时，除了所有者还没有其他成员，这个事件实质上只有所有者能收到（但紧接着还有私有事件，所以这个主要是为加入流程统一设计）。
+作用：通知服务器上**已有在线成员**"有新用户加入"。
+
+> **注意**：在服务器刚创建的场景下，这条消息发布时还没有任何人订阅该服务器频道（创建者本人也还没订阅，订阅发生在收到 ServerCreate 之后），因此实际上**无人能收到**。该事件的实际消费场景是"加入已有服务器"——其他已在线成员通过此事件更新成员列表。详见 6.6 节。
 
 #### 事件二：`ServerCreate` —— 私有事件仅发给创建者
 
@@ -814,7 +816,7 @@ loop {
 
 #### 6.5.4 服务器创建场景的订阅增量
 
-服务器创建时触发的订阅变化：
+服务器创建时触发的订阅变化（均写入内存 HashSet + 暂存到 state.Change，下一轮 `apply_state()` 才真正调用 Fred subscribe）：
 
 | 步骤 | 代码位置 | 订阅动作 |
 |------|---------|---------|
@@ -822,10 +824,12 @@ loop {
 | Bot 额外订阅成员频道 | [impl.rs#L527-L529](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L527-L529) | `insert_subscription("{server_id}u")` |
 | recalculate_server 处理可见频道 | [impl.rs#L358-L360](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L358-L360) | `insert_subscription(channel_id)` 对每个可见频道 |
 
-完成后，用户 Redis 订阅集合中新增：
+经过下一轮 `apply_state()` 同步后，用户 Redis 订阅集合中新增：
 - `{server_id}` —— 服务器级别事件（ServerUpdate、ServerMemberJoin 等）
 - `{server_id}u`（仅 Bot）—— 服务器成员事件
 - `{channel_id}` —— 对每个可访问的频道（如 General 频道）
+
+**注意**：由于订阅是延迟生效的，服务器创建时发布的 `ServerMemberJoin`（发布到 `{server_id}`）创建者本人收不到——它发布时订阅还没同步到 Redis。详见 6.6.2 节。
 
 #### 6.5.5 active_servers 与成员频道
 
