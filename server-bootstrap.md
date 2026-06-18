@@ -425,3 +425,544 @@ create_server() [delta]
 | **默认角色** | 无预设 Role 对象；通过 `default_permissions` 字段给所有成员基础权限；角色系统由后续 API 独立创建 | [servers/model.rs#L155](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/servers/model.rs#L155)、[channel.rs#L149-L155](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/permissions/src/models/channel.rs#L149-L155) |
 | **所有者授权** | `server.owner == perspective.id` 的身份比较，在权限计算最前端短路返回 `GrantAllSafe`（低 52 位全 1），不依赖任何角色 | [impl.rs#L49-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/permissions/src/impl.rs#L49-L52)、[permissions.rs#L115-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/util/permissions.rs#L115-L122) |
 | **事件广播** | 发布侧：EventV1.p() 写入 Redis Pub/Sub；订阅侧：Bonfire 用 Fred subscriber 订阅，通过 WebSocket 推送至匹配连接的客户端 | [client.rs#L366-L405](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/events/client.rs#L366-L405)、[server_members/model.rs#L164-L184](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/model.rs#L164-L184)、[websocket.rs#L221-L300](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/websocket.rs#L221-L300) |
+
+---
+
+## 6. 事件进入网关后的完整处理
+
+本章聚焦于事件从 Redis Pub/Sub 进入 Bonfire WebSocket 网关之后的完整处理链。
+
+### 6.1 网关接收流程总览
+
+[websocket.rs#L323-L398](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/websocket.rs#L323-L398)
+
+```
+Redis Message (Fred subscriber.message_rx.recv())
+  │
+  ├─ 反序列化：根据 REDIS_PAYLOAD_TYPE (Json/Msgpack/Bincode) 解码为 EventV1
+  │
+  ├─ 特殊处理：EventV1::Auth → 可能转换为 Logout 事件
+  │
+  └─ 常规事件 → state.handle_incoming_event_v1(db, &mut event)
+        │
+        ├─ 返回 false → 丢弃，不发送给客户端
+        └─ 返回 true  → write.lock().await.send(config.encode(&event))
+                        → 通过 WebSocket 发送给前端
+```
+
+### 6.2 缓存写入
+
+`State::handle_incoming_event_v1` 是事件处理的核心入口：
+
+[impl.rs#L433-L696](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L433-L696)
+
+#### 6.2.1 缓存数据结构
+
+[state.rs#L35-L61](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/state.rs#L35-L61)
+
+每个 WebSocket 连接维护独立的 `Cache`：
+
+```rust
+pub struct Cache {
+    pub user_id: String,
+    pub is_bot: bool,
+    pub users: HashMap<String, User>,        // 用户信息缓存
+    pub channels: HashMap<String, Channel>,  // 频道信息缓存
+    pub members: HashMap<String, Member>,    // 成员信息缓存 (key = server_id)
+    pub servers: HashMap<String, Server>,    // 服务器信息缓存
+    pub seen_events: LruCache<String, ()>,   // 已见事件去重 (LRU, 容量 20)
+}
+```
+
+注意：`members` 的 key 是 **server_id**，不是 member_id，即每个服务器缓存当前用户自己的成员身份。
+
+#### 6.2.2 ServerCreate 事件触发的缓存写入
+
+[impl.rs#L518-L548](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L518-L548)
+
+```rust
+EventV1::ServerCreate { id, server, channels, .. } => {
+    // ① 订阅服务器事件频道
+    self.insert_subscription(id.clone()).await;
+    if self.cache.is_bot {
+        self.insert_subscription(format!("{}u", id)).await;
+    }
+
+    // ② 服务器对象写入缓存
+    self.cache.servers.insert(id.clone(), server.clone().into());
+
+    // ③ 生成本地 Member 记录并写入缓存
+    let member = Member {
+        id: MemberCompositeKey {
+            server: server.id.clone(),
+            user: self.cache.user_id.clone(),
+        },
+        ..Default::default()   // roles=[], can_publish=true, can_receive=true
+    };
+    self.cache.members.insert(id.clone(), member);
+
+    // ④ 所有频道写入缓存
+    for channel in channels {
+        self.cache
+            .channels
+            .insert(channel.id().to_string(), channel.clone().into());
+    }
+
+    // ⑤ 标记需要重算服务器权限
+    queue_server = Some(id.clone());
+}
+```
+
+关键细节：
+- 这里写入的 Member 对象是**本地构造**的（`Default::default()`），不直接来自数据库
+- 但由于服务器创建者必然是所有者，默认值（空角色列表 + 全语音权限）完全足够
+- `queue_server = Some(id)` 触发后续的权限重算
+
+#### 6.2.3 其他事件的缓存写入对比
+
+| 事件 | 缓存操作 |
+|------|---------|
+| `ChannelCreate` | `cache.channels.insert(id, channel)` + 订阅 |
+| `ChannelUpdate` | `channel.apply_options(data)` 增量更新 + 权限变化时可能转为 Create/Delete |
+| `ChannelDelete` | `cache.channels.remove(id)` + 取消订阅 |
+| `ServerUpdate` | `server.apply_options(data)` 增量更新；若 `default_permissions` 变化则标记重算 |
+| `ServerDelete` | `cache.servers.remove(id)` + 移除所有关联频道缓存 + 移除成员缓存 |
+| `ServerMemberUpdate` | 仅当 `id.user == self.cache.user_id` 时更新本地 member；若 roles 变化则标记重算 |
+| `ServerRoleUpdate/Delete` | 更新 server.roles；若本用户拥有该角色则标记重算 |
+| `UserRelationship` | `cache.users.insert(id, user)` + 按需订阅/退订用户事件 |
+
+### 6.3 成员记录生成
+
+成员记录生成有两条路径：**数据库持久化路径**和**网关本地缓存路径**。
+
+#### 6.3.1 数据库路径：insert_or_merge_member
+
+[server_members/model.rs#L117-L127](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/model.rs#L117-L127)
+
+```rust
+let mut member = Member {
+    id: MemberCompositeKey {
+        server: server.id.to_string(),
+        user: user.id.to_string(),
+    },
+    ..Default::default()
+};
+
+if let Some(updated) = db.insert_or_merge_member(&member).await? {
+    member = updated;
+}
+```
+
+MongoDB 实现的关键逻辑：
+
+[ops/mongodb.rs#L16-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/ops/mongodb.rs#L16-L52)
+
+```rust
+async fn insert_or_merge_member(&self, member: &Member) -> Result<Option<Member>> {
+    // ① 查找是否有 pending_deletion_at 标记的"软删除"记录
+    let existing = find_one({
+        "_id.server": &member.id.server,
+        "_id.user": &member.id.user,
+        "pending_deletion_at": {"$exists": true}
+    });
+
+    if existing.is_ok_and(|x| x.is_some()) {
+        // ② 有软删除记录 → 复活：更新 joined_at，移除 pending_deletion_at
+        //    返回更新后的完整 Member（保留 timeout 等原有字段）
+        find_one_and_update(
+            {"$set": {"joined_at": ...}, "$unset": {"pending_deletion_at": ""}}
+        ).return_document(After)
+    } else {
+        // ③ 无软删除记录 → 直接插入新文档，返回 None 表示使用传入的 member
+        insert_one(&member)
+    }
+}
+```
+
+软删除（soft_delete_member）与复活机制的配合：
+
+[ops/mongodb.rs#L269-L301](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/ops/mongodb.rs#L269-L301)
+
+- 用户被踢出时，如果仍在 timeout 禁言期 → **不直接删除**，而是标记 `pending_deletion_at = timeout 到期时间`，同时清空 `joined_at/avatar/nickname/roles`
+- 用户重新加入时 → 通过 `insert_or_merge_member` 找到软删除记录，重置 `joined_at` 并移除标记，保留 timeout（禁言期继续有效）
+- crond 定时任务定期清理 `pending_deletion_at < now` 的记录
+
+这就是 `muted_member_rejoin` 测试用例验证的场景。
+
+#### 6.3.2 网关本地路径：ServerCreate 时构造
+
+在网关侧，`ServerCreate` 事件处理时会在本地缓存中直接构造 Member：
+
+[impl.rs#L532-L539](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L532-L539)
+
+```rust
+let member = Member {
+    id: MemberCompositeKey {
+        server: server.id.clone(),
+        user: self.cache.user_id.clone(),
+    },
+    ..Default::default()
+};
+self.cache.members.insert(id.clone(), member);
+```
+
+这与 Ready 阶段从数据库批量拉取的行为一致：
+
+[impl.rs#L219-L223](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L219-L223)
+
+```rust
+self.cache.members = members
+    .iter()
+    .cloned()
+    .map(|x| (x.id.server.clone(), x))  // key = server_id
+    .collect();
+```
+
+### 6.4 权限重算
+
+#### 6.4.1 触发时机
+
+`handle_incoming_event_v1` 通过三个变量决定是否需要重算：
+
+```rust
+let mut queue_server = None;  // 需要重算整个服务器
+let mut queue_add = None;     // 需要新增单个订阅
+let mut queue_remove = None;  // 需要移除单个订阅
+```
+
+以下事件会设置 `queue_server = Some(server_id)`：
+
+| 事件 | 触发条件 |
+|------|---------|
+| `ServerCreate` | **无条件触发** |
+| `ServerUpdate` | `data.default_permissions.is_some()`（服务器默认权限变更） |
+| `ServerMemberUpdate` | `id.user == self.user_id` 且 (`data.roles.is_some()` 或移除了 Roles) |
+| `ServerRoleUpdate` | 本用户拥有该角色（`member.roles.contains(role_id)`）且权限或 rank 变化 |
+| `ServerRoleDelete` | 本用户拥有该角色 |
+
+#### 6.4.2 重算逻辑：recalculate_server
+
+[impl.rs#L334-L401](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L334-L401)
+
+```rust
+pub async fn recalculate_server(&mut self, db: &Database, id: &str, event: &mut EventV1) {
+    if let Some(server) = self.cache.servers.get(id) {
+        // ① 遍历所有已缓存的、属于该服务器的频道
+        let mut added_channels = vec![];
+        let mut removed_channels = vec![];
+
+        for (channel_id, channel) in &self.cache.channels {
+            if channel.server() == Some(id) {
+                // ② 用当前用户的最新权限重新检查 ViewChannel
+                if self.cache.can_view_channel(db, channel).await {
+                    added_channels.push(channel_id.clone());
+                } else {
+                    removed_channels.push(channel_id.clone());
+                }
+            }
+        }
+
+        // ③ 处理权限被移除的频道
+        for id in removed_channels {
+            self.remove_subscription(&id).await;
+            self.cache.channels.remove(&id);
+            bulk_events.push(EventV1::ChannelDelete { id });
+        }
+
+        // ④ 处理权限新增的频道
+        for id in added_channels {
+            self.insert_subscription(id).await;
+        }
+
+        // ⑤ 检查服务器声明但缓存未知的频道（增量拉取）
+        let known_ids = server.channels.iter().cloned().collect::<HashSet<_>>();
+        let unknowns = known_ids.difference(&cached_channel_ids).collect::<Vec<_>>();
+
+        if !unknowns.is_empty() {
+            if let Ok(channels) = db.fetch_channels(&unknowns).await {
+                let viewable = self.cache.filter_accessible_channels(db, channels).await;
+                for channel in viewable {
+                    self.cache.channels.insert(channel.id().to_string(), channel.clone());
+                    self.insert_subscription(channel.id().to_string()).await;
+                    bulk_events.push(EventV1::ChannelCreate(channel.into()));
+                }
+            }
+        }
+
+        // ⑥ 如果有增删事件，用 Bulk 包装替换原事件
+        if !bulk_events.is_empty() {
+            let mut new_event = EventV1::Bulk { v: bulk_events };
+            std::mem::swap(&mut new_event, event);
+            if let EventV1::Bulk { v } = event {
+                v.push(new_event);  // 原 ServerCreate 也被塞进 Bulk 里
+            }
+        }
+    }
+}
+```
+
+#### 6.4.3 权限判定：can_view_channel
+
+[impl.rs#L19-L46](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L19-L46)
+
+```rust
+pub async fn can_view_channel(&self, db: &Database, channel: &Channel) -> bool {
+    match &channel {
+        Channel::TextChannel { server, .. } => {
+            // 用缓存中的 member 和 server 构造权限查询
+            let mut query = DatabasePermissionQuery::new(
+                db, self.users.get(&self.user_id).unwrap()
+            ).channel(channel);
+
+            if let Some(member) = self.members.get(server) {
+                query = query.member(member);
+            }
+            if let Some(server) = self.servers.get(server) {
+                query = query.server(server);
+            }
+
+            calculate_channel_permissions(&mut query)
+                .await
+                .has_channel_permission(ChannelPermission::ViewChannel)
+        }
+        _ => true,  // DM/Group/SavedMessages 不需要额外判定
+    }
+}
+```
+
+对于服务器创建场景，由于用户是所有者，`calculate_channel_permissions` 会短路返回 `GrantAllSafe`，所有频道都可见。但该机制在角色变更、默认权限变更等场景至关重要。
+
+### 6.5 频道订阅变化
+
+#### 6.5.1 订阅状态管理
+
+[state.rs#L10-L21](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/state.rs#L10-L21)
+
+```rust
+pub enum SubscriptionStateChange {
+    None,
+    Reset,                          // 清空所有订阅后重建
+    Change { add: Vec<String>, remove: Vec<String> },  // 增量变更
+}
+```
+
+`State` 维护两个同步状态：
+- `state: SubscriptionStateChange` —— 待提交的变更（逻辑层）
+- `subscribed: Arc<RwLock<HashSet<String>>>` —— 当前已生效的订阅集合（Redis 层）
+
+#### 6.5.2 插入/移除订阅
+
+[state.rs#L164-L208](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/state.rs#L164-L208)
+
+```rust
+pub async fn insert_subscription(&mut self, subscription: String) {
+    let mut subscribed = self.subscribed.write().await;
+    if subscribed.contains(&subscription) {
+        return;  // 去重：已订阅则忽略
+    }
+
+    // 更新待提交的变更
+    match &mut self.state {
+        SubscriptionStateChange::None => {
+            self.state = SubscriptionStateChange::Change {
+                add: vec![subscription.clone()], remove: vec![]
+            };
+        }
+        SubscriptionStateChange::Change { add, .. } => {
+            add.push(subscription.clone());
+        }
+        SubscriptionStateChange::Reset => {}  // Reset 模式下无需记录增量
+    }
+
+    subscribed.insert(subscription);
+}
+```
+
+核心设计：**先写 subscribed（立即生效的内存集合），再写 state（在下一轮 apply_state 时同步到 Redis）**。这防止了重复订阅检查与 Redis 实际订阅之间的竞态。
+
+#### 6.5.3 订阅同步到 Redis
+
+[state.rs#L103-L151](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/state.rs#L103-L151) +
+[websocket.rs#L267-L306](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/websocket.rs#L267-L306)
+
+`apply_state()` 在 listener 主循环的每次迭代开始时被调用：
+
+```rust
+loop {
+    // ① 先同步订阅变更
+    match state.apply_state().await {
+        SubscriptionStateChange::Reset => {
+            subscriber.unsubscribe_all().await;
+            for id in subscribed.iter() {
+                subscriber.subscribe(id).await;
+            }
+        }
+        SubscriptionStateChange::Change { add, remove } => {
+            for id in remove { subscriber.unsubscribe(id).await; }
+            for id in add { subscriber.subscribe(id).await; }
+        }
+        SubscriptionStateChange::None => {}
+    }
+
+    // ② 再等待消息
+    select! {
+        message = message_rx.recv() => { ... },
+        ...
+    }
+}
+```
+
+#### 6.5.4 服务器创建场景的订阅增量
+
+服务器创建时触发的订阅变化：
+
+| 步骤 | 代码位置 | 订阅动作 |
+|------|---------|---------|
+| 插入服务器本身 | [impl.rs#L525](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L525) | `insert_subscription(server_id)` |
+| Bot 额外订阅成员频道 | [impl.rs#L527-L529](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L527-L529) | `insert_subscription("{server_id}u")` |
+| recalculate_server 处理可见频道 | [impl.rs#L358-L360](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L358-L360) | `insert_subscription(channel_id)` 对每个可见频道 |
+
+完成后，用户 Redis 订阅集合中新增：
+- `{server_id}` —— 服务器级别事件（ServerUpdate、ServerMemberJoin 等）
+- `{server_id}u`（仅 Bot）—— 服务器成员事件
+- `{channel_id}` —— 对每个可访问的频道（如 General 频道）
+
+#### 6.5.5 active_servers 与成员频道
+
+[state.rs#L103-L135](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/state.rs#L103-L135)
+
+`apply_state` 还额外维护 `active_servers`（LRU 时间缓存，900 秒 TTL，容量 5）：
+
+```rust
+if !self.cache.is_bot {
+    // 根据 active_servers 的到期状态决定是否订阅/退订 {server_id}u
+    // Valid → Subscribe("{server_id}u")
+    // Expired → Unsubscribe("{server_id}u")
+}
+```
+
+设计意图：普通用户只在"活跃服务器"上订阅成员级事件频道，避免订阅过多频道浪费资源；Bot 用户则订阅所有服务器的成员频道。
+
+### 6.6 成员加入事件为何不重复处理
+
+服务器创建流程中会触发两个事件：
+1. `EventV1::ServerMemberJoin` → `.p(server_id)` 发布到服务器频道
+2. `EventV1::ServerCreate` → `.private(user_id)` 发布到私有频道
+
+用户客户端同时订阅了 `{server_id}` 和 `{user_id}!`，按理会同时收到这两个事件。但代码做了显式的空操作处理：
+
+[impl.rs#L564-L566](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L564-L566)
+
+```rust
+EventV1::ServerMemberJoin { .. } => {
+    // We will always receive ServerCreate when joining a new server.
+}
+```
+
+注释直接说明原因：**加入新服务器时必然会先收到 ServerCreate**，ServerMemberJoin 只是冗余事件。
+
+#### 6.6.1 三层去重设计
+
+| 层级 | 机制 | 位置 |
+|------|------|------|
+| **第一层：应用层空处理** | `handle_incoming_event_v1` 中对 `ServerMemberJoin` 直接空匹配，不做任何缓存写入或订阅变更 | [impl.rs#L564-L566](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L564-L566) |
+| **第二层：数据库前置校验** | `Member::create` 入口先检查 `fetch_member` 是否已存在 | [server_members/model.rs#L109-L115](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/model.rs#L109-L115) |
+| **第三层：insert_or_merge 幂等** | 若软删除记录存在则复活而非重复插入；MongoDB 复合主键 `(server, user)` 本身保证唯一性 | [ops/mongodb.rs#L16-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/ops/mongodb.rs#L16-L52) |
+
+#### 6.6.2 为何 ServerCreate 足够而 ServerMemberJoin 冗余
+
+`ServerCreate` 事件携带的信息严格包含且远超 `ServerMemberJoin`：
+
+| 字段 | ServerCreate | ServerMemberJoin |
+|------|-------------|-----------------|
+| 服务器完整信息 | ✓ server 对象 | ✗ 仅 id |
+| 频道列表 | ✓ channels 数组 | ✗ |
+| 表情列表 | ✓ emojis 数组 | ✗ |
+| 语音状态 | ✓ voice_states 数组 | ✗ |
+| 成员信息 | ✗（网关本地构造） | ✓ member 对象 |
+
+网关在处理 `ServerCreate` 时会：
+- 写入服务器缓存
+- 写入所有频道缓存
+- **本地构造 Member 记录写入缓存**（不需要 ServerMemberJoin 的 member 字段）
+- 触发权限重算和频道订阅
+- 最终发送给客户端包含完整数据的 ServerCreate（或 Bulk）
+
+因此，即使 `ServerMemberJoin` 随后到达，它既不能提供额外信息，也无需触发额外操作——空处理是完全正确的设计。
+
+对比其他成员加入场景（如通过邀请链接加入已有服务器）：此时没有 ServerCreate 事件，ServerMemberJoin 才是有效的通知源，其他在线成员需通过它更新成员列表。但对**被加入者本人**，由于 Redis 私有频道机制，会优先收到更完整的 ServerCreate。
+
+#### 6.6.3 补充：UserUpdate 事件的 seen_events 去重
+
+对于 `EventV1::UserUpdate`，还存在额外的基于 event_id 的 LRU 去重：
+
+[impl.rs#L643-L653](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L643-L653)
+
+```rust
+EventV1::UserUpdate { event_id, .. } => {
+    if let Some(id) = event_id {
+        if self.cache.seen_events.contains(id) {
+            return false;  // 已处理过，丢弃
+        }
+        self.cache.seen_events.put(id.to_string(), ());
+    }
+    *event_id = None;  // 清除后再发给客户端
+}
+```
+
+`seen_events` 是容量 20 的 LRU 缓存，防止在线状态变更等广播事件因多频道转发而重复送达同一连接。
+
+---
+
+## 7. 网关侧完整时序图（服务器创建场景）
+
+```
+Redis Pub/Sub
+  │
+  ├─ Channel: "{user_id}!" → EventV1::ServerCreate
+  │     │
+  │     ▼
+  │   Fred subscriber.message_rx.recv()
+  │     │
+  │     ▼
+  │   serde_json / rmp_serde / bincode 反序列化为 EventV1
+  │     │
+  │     ▼
+  │   state.handle_incoming_event_v1(db, &mut event)
+  │     │
+  │     ├─ 匹配 EventV1::ServerCreate
+  │     │   ├─ insert_subscription(server_id)
+  │     │   │   └─ subscribed HashSet 插入 + state.Change.add 记录
+  │     │   ├─ (Bot 额外) insert_subscription("{server_id}u")
+  │     │   ├─ cache.servers.insert(server_id, server)
+  │     │   ├─ cache.members.insert(server_id, Member::default())
+  │     │   ├─ for channel in channels: cache.channels.insert(channel_id, channel)
+  │     │   └─ queue_server = Some(server_id)
+  │     │
+  │     ├─ queue_server.is_some() → self.recalculate_server(db, server_id, event)
+  │     │   ├─ 遍历缓存频道，can_view_channel 重算权限
+  │     │   ├─ 对每个可见频道: insert_subscription(channel_id)
+  │     │   ├─ 拉取服务器声明但缓存未知的频道 (db.fetch_channels)
+  │     │   ├─ filter_accessible_channels 过滤
+  │     │   ├─ 新增可见频道写入 cache.channels + 订阅 + ChannelCreate 事件
+  │     │   └─ 若有新增/删除事件 → mem::swap 为 EventV1::Bulk { [ChannelCreate..., 原 ServerCreate] }
+  │     │
+  │     └─ 返回 true（需要发送给客户端）
+  │
+  ├─ Channel: "{server_id}" → EventV1::ServerMemberJoin
+  │     │
+  │     ▼
+  │   state.handle_incoming_event_v1(db, &mut event)
+  │     │
+  │     └─ 匹配 EventV1::ServerMemberJoin { .. } => { /* 空处理 */ }
+  │        └─ 返回 true（仍转发给客户端用于 UI 更新成员列表）
+  │
+  ▼
+WebSocket send(config.encode(&event))
+  │
+  ▼
+前端客户端
+  ├─ ServerCreate (或 Bulk 包) → 渲染服务器、频道、表情、语音状态
+  └─ ServerMemberJoin → (可选) 更新成员侧边栏
+```
+
