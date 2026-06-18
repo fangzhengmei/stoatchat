@@ -204,9 +204,7 @@ self.col::<Document>(COL)
 
 修复方向：把条件下推到 MongoDB，用 `update_one(doc! { "_id": channel, "recipients": { "$ne": user } }, doc! { "$push": ... })` 或者直接改用 `$addToSet`。
 
----
-
-## 5.6 并发边界：群组邀请非创建者删除的实际表现？**panic，当前请求线程异常终止**
+### 5.6 并发边界：群组邀请非创建者删除的实际表现？**panic，当前请求线程异常终止**
 
 删除分支 [crates/delta/src/routes/invites/invite_delete.rs](crates/delta/src/routes/invites/invite_delete.rs#L21-L32)：
 
@@ -337,6 +335,10 @@ pub async fn can_acquire_server(&self, db: &Database) -> Result<()> {
 - **无有效期**：见第 6 节。
 - **无签发数量上限**：见第 3 节。
 - **等于限额时仍放行**：见 8.1。
+- **服务器数量检查与成员写入非原子**：见 5.4，并发核销可绕过 `can_acquire_server` 限额。
+- **群组并发加入可能产生重复 recipient 并绕过群规模上限**：见 5.5，内存检查 + `$push` 无原子性。
+- **群组邀请非创建者删除会 500 panic**：见 5.6，`unreachable!()` 直接 panic 而非返回业务错误。
+- **邀请码随机码冲突无重试**：见 5.7，应用层不捕获 duplicate key 并换码，冲突时返回 500。
 - 因此对“恶意扩散邀请码”的防护主要依赖：速率限制、`ManageServer` 持有者手动删除、服务器封禁（`Banned`）以及 `can_acquire_server` 对加入方数量的限制，而非邀请码本身的额度/时效约束。
 
 ---
