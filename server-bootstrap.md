@@ -368,12 +368,18 @@ Bonfire 是独立的 WebSocket 服务器进程：
 - **Reset**：清空并重新订阅所有频道
 - **Change**：增量添加/移除订阅（add / remove）
 
-用户至少订阅的频道包括：
+用户在 Ready 阶段完成初始订阅，包括：
 - `{user_id}!` —— 私有事件频道（对应 `.private()` 方法），因此 `ServerCreate` 事件能送达
-- `{server_id}` —— 用户加入的每个服务器（对应 `.p(server_id)`），因此 `ServerMemberJoin` 能送达
+- `{server_id}` —— 用户**已加入**的每个服务器（对应 `.p(server_id)`），因此**已有服务器上的** `ServerMemberJoin` 能送达
 - `{server_id}u` —— 服务器成员频道（对应 `.server()` 方法）
 
-### 4.6 完整时序图
+> **注意**：新创建的服务器在 Ready 阶段时尚未存在，因此**初始订阅不包含新服务器的频道**。创建者对新服务器的订阅是在收到 `ServerCreate` 事件后动态添加的，且要等到下一轮 `apply_state()` 才真正同步到 Redis。详见第 6 章。
+
+### 4.6 成员加入事件接收链路总览
+
+`Member::create` 始终发布两个事件，但不同场景下的接收方不同。
+
+#### 场景一：创建新服务器
 
 ```
 用户 POST /servers/create
@@ -382,42 +388,78 @@ Bonfire 是独立的 WebSocket 服务器进程：
 create_server() [delta]
   │
   ├─► Server::create()
-  │     ├─ 构建 Server 对象 (owner=user.id, default_permissions=DEFAULT_PERMISSION_SERVER)
+  │     ├─ 构建 Server (owner=user.id, default_permissions=DEFAULT_PERMISSION_SERVER)
   │     ├─► Channel::create_server_channel()
-  │     │     └─ 创建 TextChannel "General" → db.insert_channel()
+  │     │     └─ TextChannel "General" → db.insert_channel()
   │     ├─ 收集频道 ID 到 server.channels
   │     └─ db.insert_server()
   │
   └─► Member::create()
         ├─ 检查 ban / 是否已在服务器
-        ├─ 构建 Member 对象 → db.insert_or_merge_member()
+        ├─ 构建 Member → db.insert_or_merge_member()
         │
-        ├─ ① EventV1::ServerMemberJoin
-        │     └─ .p(server_id) → Redis Channel = server_id
+        ├─ ① EventV1::ServerMemberJoin.p(server_id)
+        │     └─ Redis Channel = "{新server_id}"
+        │          └─ 无人订阅 → 消息丢失
         │
-        ├─ ② EventV1::ServerCreate
-        │     └─ .private(user_id) → Redis Channel = user_id!
+        ├─ ② EventV1::ServerCreate.private(user_id)
+        │     └─ Redis Channel = "{user_id}!"
+        │          └─ 创建者已订阅 → 正常送达
         │
         └─ (可选) SystemMessage::UserJoined
-              └─ 仅当 server.system_messages.user_joined 配置时
+              └─ 新服务器 system_messages=None → 不触发
 
-                      │
-                      ▼
-                Redis Pub/Sub
-                      │
-                      ▼
-            Bonfire subscriber [bonfire]
-                      │
-                      ├─ 匹配到用户 WebSocket 连接
-                      └─ WebSocket.send(编码后的事件)
-                              │
-                              ▼
-                        前端客户端
-                         ├─ ServerCreate: 在 UI 中渲染新服务器 + General 频道
-                         └─ ServerMemberJoin: 更新服务器成员列表
+                            │
+                            ▼ (只有 ServerCreate 到达创建者)
+                      Bonfire (网关)
+                            │
+                            ├─ 缓存写入 (server / channels / 本地 member)
+                            ├─ 权限重算 (recalculate_server)
+                            ├─ 动态添加订阅 (server_id + 各 channel_id)
+                            └─ WebSocket.send()
+                                    │
+                                    ▼
+                              前端：渲染新服务器 + General 频道
 ```
 
----
+#### 场景二：加入已有服务器
+
+```
+用户 B 通过邀请加入服务器 S
+  │
+  ▼
+Member::create() [delta]
+  │
+  ├─ 检查 ban / 是否已在服务器
+  ├─ 构建 Member B → db.insert_or_merge_member()
+  │
+  ├─ ① EventV1::ServerMemberJoin.p(server_id)
+  │     └─ Redis Channel = "{S_id}"
+  │          ├─ 用户 A (已有在线成员)：已订阅 → 收到
+  │          └─ 用户 B (新成员)：还没订阅 → 收不到
+  │
+  └─ ② EventV1::ServerCreate.private(user_id_B)
+        └─ Redis Channel = "{user_id_B}!"
+             └─ 用户 B 已订阅私有频道 → 收到
+
+     ┌───────────────────────────────────────────────┐
+     │              Bonfire (网关)                   │
+     │                                               │
+     │  用户 A 的连接：                               │
+     │    ServerMemberJoin → 空处理(不改缓存)       │
+     │                → 仍转发给前端 → UI +1 成员    │
+     │                                               │
+     │  用户 B 的连接：                               │
+     │    ServerCreate → 缓存写入 + 权限重算         │
+     │                → 添加订阅 + 转发给前端         │
+     │                → 渲染服务器 + 所有频道        │
+     └───────────────────────────────────────────────┘
+```
+
+**统一结论**：
+- `ServerMemberJoin` 的目标接收者是**其他已有在线成员**，不是新成员本人
+- 新成员本人始终只通过私有频道收到 `ServerCreate`
+- ServerMemberJoin 在网关侧"空处理"= 不更新本地缓存和订阅，但仍转发给前端 UI
 
 ## 5. 四段关系总结
 
