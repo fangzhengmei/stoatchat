@@ -843,13 +843,85 @@ if !self.cache.is_bot {
 
 设计意图：普通用户只在"活跃服务器"上订阅成员级事件频道，避免订阅过多频道浪费资源；Bot 用户则订阅所有服务器的成员频道。
 
-### 6.6 成员加入事件为何不重复处理
+### 6.6 ServerMemberJoin 事件的空处理逻辑
 
-服务器创建流程中会触发两个事件：
-1. `EventV1::ServerMemberJoin` → `.p(server_id)` 发布到服务器频道
-2. `EventV1::ServerCreate` → `.private(user_id)` 发布到私有频道
+服务器创建流程中会按以下顺序发布两个事件：
 
-用户客户端同时订阅了 `{server_id}` 和 `{user_id}!`，按理会同时收到这两个事件。但代码做了显式的空操作处理：
+[server_members/model.rs#L164-L184](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/model.rs#L164-L184)
+
+1. **先** `EventV1::ServerMemberJoin` → `.p(server_id)` 发布到 Redis Channel = `{server_id}`
+2. **后** `EventV1::ServerCreate` → `.private(user_id)` 发布到 Redis Channel = `{user_id}!`
+
+#### 6.6.1 服务器创建前用户的订阅状态
+
+[state.rs#L77-L101](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/state.rs#L77-L101)
+
+WebSocket 连接建立时 `State::from(user)` 初始化的订阅集合：
+
+```rust
+let mut subscribed = HashSet::new();
+let private_topic = format!("{}!", user.id);  // "{user_id}!"
+subscribed.insert(private_topic.clone());      // 私有事件频道
+subscribed.insert(user.id.clone());            // 用户自身事件频道
+```
+
+之后 Ready 阶段 `generate_ready_payload` 会追加订阅：
+
+[impl.rs#L287-L305](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L287-L305)
+
+- 所有好友/相关用户的 `{user_id}`
+- 用户已加入的**已有**服务器的 `{server_id}`
+- Bot 额外订阅 `{server_id}u`
+- 用户可访问的**已有**频道的 `{channel_id}`
+
+**关键点**：新建的服务器 ID 在 Ready 阶段不存在，所以**用户此时没有订阅 `{新server_id}`**。
+
+#### 6.6.2 哪些连接能收到 ServerMemberJoin
+
+Redis Pub/Sub 是**即时广播**，只有发布时已订阅该 channel 的客户端才能收到消息，不保留历史。
+
+| 事件 | 发布到的 Channel | 发布时谁已订阅 | 实际结果 |
+|------|-----------------|--------------|---------|
+| `ServerMemberJoin` | `{新server_id}` | **没人**（服务器刚创建，没有任何成员在线，创建者本人也还没订阅） | 消息丢失，无人收到 |
+| `ServerCreate` | `{user_id}!` | 创建者本人（Ready 阶段就已订阅私有频道） | 创建者正常收到 |
+
+创建者对 `{新server_id}` 的订阅发生在**收到 ServerCreate 之后**：
+
+[impl.rs#L523-L525](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L523-L525)
+
+```rust
+// 在 handle_incoming_event_v1 处理 ServerCreate 时执行
+self.insert_subscription(id.clone()).await;
+```
+
+但 `insert_subscription` 只是修改内存的 `subscribed` HashSet 和暂存 `state.Change`，真正调用 Fred 的 `subscriber.subscribe()` 要等到下一轮循环的 `apply_state()`：
+
+[websocket.rs#L268-L306](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/websocket.rs#L268-L306)
+
+```rust
+'out: loop {
+    // ① 先 apply_state，把暂存的订阅变更同步到 Redis
+    match state.apply_state().await {
+        SubscriptionStateChange::Change { add, .. } => {
+            for id in add { subscriber.subscribe(id).await; }
+        }
+        ...
+    }
+    // ② 再等待消息
+    select! { message = message_rx.recv() => { ... } }
+}
+```
+
+所以时序是：
+1. ServerMemberJoin 发布到 `{server_id}` → 无人订阅 → 丢失
+2. ServerCreate 发布到 `{user_id}!` → 创建者已订阅 → 收到
+3. 创建者处理 ServerCreate → `insert_subscription(server_id)`（暂存）
+4. 下一轮循环 → `apply_state()` → 真正 `subscriber.subscribe(server_id)`
+5. 此后该服务器上的新事件创建者才能收到
+
+因此，在服务器创建场景中，**创建者本人根本不会收到 ServerMemberJoin**。注释中说"We will always receive ServerCreate when joining a new server"的含义不是"两个事件都会收到所以 ServerMemberJoin 冗余"，而是**"当你作为新成员加入时，你收到的是 ServerCreate，而非 ServerMemberJoin"**。
+
+#### 6.6.3 空处理 + 返回 true 的真实含义
 
 [impl.rs#L564-L566](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L564-L566)
 
@@ -857,44 +929,52 @@ if !self.cache.is_bot {
 EventV1::ServerMemberJoin { .. } => {
     // We will always receive ServerCreate when joining a new server.
 }
+// ...
+true  // 函数末尾默认返回 true
 ```
 
-注释直接说明原因：**加入新服务器时必然会先收到 ServerCreate**，ServerMemberJoin 只是冗余事件。
+`handle_incoming_event_v1` 的返回值语义：
+- `return true` → 事件通过 WebSocket **转发给前端客户端**
+- `return false` → **丢弃**，不发送给客户端
 
-#### 6.6.1 三层去重设计
+ServerMemberJoin 的空匹配 `{}` + 默认返回 `true` 合起来的含义是：
+
+| 行为 | 原因 |
+|------|------|
+| **不更新网关本地缓存** | `cache.members` 的 key 是 server_id，value 是**本用户自己**的 Member 记录（用于权限计算）。别的成员加入不影响本用户的缓存 |
+| **不修改订阅状态** | 其他成员加入不改变本用户对任何频道/服务器的订阅 |
+| **仍转发给前端** | 前端 UI 需要展示成员列表变化（比如侧边栏 +1、系统通知），这些是前端渲染逻辑，网关无需参与 |
+
+#### 6.6.4 ServerMemberJoin 的实际消费场景
+
+ServerMemberJoin 的目标接收者**不是新成员本人**，而是服务器上的**其他已有在线成员**：
+
+**场景：用户 B 通过邀请加入已存在的服务器 S**
+- 服务器 S 已存在，用户 A 是 S 的成员且在线
+- 用户 A 在 Ready 阶段已订阅 `{S_id}`
+- B 加入时，Member::create 发布 ServerMemberJoin 到 `{S_id}`
+- A 收到 ServerMemberJoin 事件
+- 网关侧：空处理（不更新 A 的缓存），但转发给 A 的前端
+- A 的前端 UI：成员列表显示 B 加入
+
+**场景：用户 A 创建新服务器 S（即服务器创建流程）**
+- 创建时没有其他成员
+- ServerMemberJoin 发布到 `{S_id}` 但无人订阅 → 无人收到
+- 只有 ServerCreate 通过私有频道到达 A 本人
+
+#### 6.6.5 成员记录不重复插入的保障（数据库层）
+
+注意：这与"事件重复处理"是不同层次的问题，不要混淆。成员记录的唯一性由数据库层三层保障：
 
 | 层级 | 机制 | 位置 |
 |------|------|------|
-| **第一层：应用层空处理** | `handle_incoming_event_v1` 中对 `ServerMemberJoin` 直接空匹配，不做任何缓存写入或订阅变更 | [impl.rs#L564-L566](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L564-L566) |
-| **第二层：数据库前置校验** | `Member::create` 入口先检查 `fetch_member` 是否已存在 | [server_members/model.rs#L109-L115](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/model.rs#L109-L115) |
-| **第三层：insert_or_merge 幂等** | 若软删除记录存在则复活而非重复插入；MongoDB 复合主键 `(server, user)` 本身保证唯一性 | [ops/mongodb.rs#L16-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/ops/mongodb.rs#L16-L52) |
+| **第一层：应用前置校验** | `Member::create` 先 `fetch_member(server, user)`，已存在则返回 `Error::AlreadyInServer` | [server_members/model.rs#L109-L115](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/model.rs#L109-L115) |
+| **第二层：insert_or_merge 幂等** | 软删除记录存在则复活而非重复插入；返回 `Some(updated)` 表示走了复活分支 | [ops/mongodb.rs#L16-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/core/database/src/models/server_members/ops/mongodb.rs#L16-L52) |
+| **第三层：数据库复合主键** | MongoDB 的 `_id` 是 `{server, user}` 复合对象，数据库层面保证唯一 | schema 定义 |
 
-#### 6.6.2 为何 ServerCreate 足够而 ServerMemberJoin 冗余
+#### 6.6.6 补充：UserUpdate 事件的 seen_events 去重
 
-`ServerCreate` 事件携带的信息严格包含且远超 `ServerMemberJoin`：
-
-| 字段 | ServerCreate | ServerMemberJoin |
-|------|-------------|-----------------|
-| 服务器完整信息 | ✓ server 对象 | ✗ 仅 id |
-| 频道列表 | ✓ channels 数组 | ✗ |
-| 表情列表 | ✓ emojis 数组 | ✗ |
-| 语音状态 | ✓ voice_states 数组 | ✗ |
-| 成员信息 | ✗（网关本地构造） | ✓ member 对象 |
-
-网关在处理 `ServerCreate` 时会：
-- 写入服务器缓存
-- 写入所有频道缓存
-- **本地构造 Member 记录写入缓存**（不需要 ServerMemberJoin 的 member 字段）
-- 触发权限重算和频道订阅
-- 最终发送给客户端包含完整数据的 ServerCreate（或 Bulk）
-
-因此，即使 `ServerMemberJoin` 随后到达，它既不能提供额外信息，也无需触发额外操作——空处理是完全正确的设计。
-
-对比其他成员加入场景（如通过邀请链接加入已有服务器）：此时没有 ServerCreate 事件，ServerMemberJoin 才是有效的通知源，其他在线成员需通过它更新成员列表。但对**被加入者本人**，由于 Redis 私有频道机制，会优先收到更完整的 ServerCreate。
-
-#### 6.6.3 补充：UserUpdate 事件的 seen_events 去重
-
-对于 `EventV1::UserUpdate`，还存在额外的基于 event_id 的 LRU 去重：
+对于 `EventV1::UserUpdate`，才存在真正的"同连接重复接收"问题——因为用户变更事件可能同时通过 `{user_id}`（被关注者的频道）和 `{server_id}`（用户所在服务器频道）等多条路径转发。网关层通过 LRU 去重：
 
 [impl.rs#L643-L653](file:///d:/fz/0601-2/solo-dogfeeding/code/38-backend/crates/bonfire/src/events/impl.rs#L643-L653)
 
@@ -902,15 +982,15 @@ EventV1::ServerMemberJoin { .. } => {
 EventV1::UserUpdate { event_id, .. } => {
     if let Some(id) = event_id {
         if self.cache.seen_events.contains(id) {
-            return false;  // 已处理过，丢弃
+            return false;  // 已处理过，丢弃，也不转发给前端
         }
         self.cache.seen_events.put(id.to_string(), ());
     }
-    *event_id = None;  // 清除后再发给客户端
+    *event_id = None;  // 清除后再发给客户端，减少前端负担
 }
 ```
 
-`seen_events` 是容量 20 的 LRU 缓存，防止在线状态变更等广播事件因多频道转发而重复送达同一连接。
+`seen_events` 是容量 20 的 `LruCache<String, ()>`，只存 event_id 不存值。这是**真正的事件去重**，与 ServerMemberJoin 的"空处理"（不更新缓存但仍转发）语义完全不同。
 
 ---
 
